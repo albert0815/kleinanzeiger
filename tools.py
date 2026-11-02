@@ -180,23 +180,22 @@ def _ask_confirmation(action: str, ad_key: str) -> str:
 
 @tool
 def list_kleinanzeigen_ads() -> dict:
-    """Show the user's ads, comparing local files with the last online snapshot.
+    """Show the ads that are on Kleinanzeigen, as of the last online check.
 
     Returns:
     - synced_at: UTC time of the last online check, null if there was none
     - health: result of the last online check; ok is false if it failed
-    - ads: entries with key (use it for the other tools), title, price, ad_id,
-      expires, expiring_soon and status. status is one of: online, reserved,
-      missing (locally active but not online), draft (never published),
-      inactive, sold, unknown (no online check yet)
-    - online_only: ads that are online but have no local file
+    - ads: entries with key (use it for the other tools; null means not editable
+      yet), title, state (active, reserved or inactive), expires, expiring_soon
+      and auto_republish
 
+    Prices are not available here. Never talk about local files.
     Always mention synced_at. Call refresh_kleinanzeigen_status if it is old.
     """
     chat_id = _chat_id_ctx.get()
     if chat_id is None:
         return {"error": "Kein Nutzerkontext verfügbar."}
-    return ad_store.overview(chat_id)
+    return ad_store.online_view(chat_id)
 
 
 @tool
@@ -250,11 +249,12 @@ def mark_kleinanzeigen_ad_sold(ad_key: str) -> str:
 
 
 @tool
-def deactivate_kleinanzeigen_ad(ad_key: str) -> str:
-    """Mark an ad inactive locally. It stays online until it expires or is deleted.
+def set_kleinanzeigen_auto_republish(ad_key: str, enabled: bool) -> str:
+    """Turn automatic republishing on or off for an ad. It stays online either way.
 
     Args:
         ad_key: the 'key' value returned by list_kleinanzeigen_ads()
+        enabled: true to republish automatically, false to stop
     """
     chat_id = _chat_id_ctx.get()
     if chat_id is None:
@@ -263,8 +263,9 @@ def deactivate_kleinanzeigen_ad(ad_key: str) -> str:
     if not ad:
         return f"Fehler: Kein Inserat mit Schlüssel {ad_key} gefunden."
     try:
-        ad_store.set_active(ad.path, False)
+        ad_store.set_active(ad.path, enabled)
     except OSError as e:
         return f"Fehler beim Schreiben: {e}"
-    log.info("[chat=%d] Deactivated ad '%s' locally", chat_id, ad.title)
-    return f"Inserat «{ad.title}» lokal deaktiviert."
+    log.info("[chat=%d] Auto-republish %s for '%s'", chat_id, enabled, ad.title)
+    state = "wird wieder" if enabled else "wird nicht mehr"
+    return f"Inserat «{ad.title}» {state} automatisch neu geschaltet."

@@ -74,15 +74,8 @@ FAILURE_HINTS = {
     "browser": "Der Browser ließ sich nicht starten.",
     "timeout": "Kleinanzeigen hat nicht rechtzeitig geantwortet.",
 }
-STATUS_LABELS = {
-    "online": "🟢 online",
-    "reserved": "🟡 reserviert",
-    "missing": "⚠️ fehlt online",
-    "draft": "📝 nie geschaltet",
-    "inactive": "🔴 inaktiv",
-    "sold": "💰 verkauft",
-    "unknown": "❔ noch nicht geprüft",
-}
+ONLINE_STATE_LABELS = {"active": "🟢 online", "reserved": "🟡 reserviert"}
+OTHER_STATE_LABEL = "⚪ deaktiviert"
 
 
 def _user_work_dir(chat_id: int) -> Path:
@@ -298,33 +291,27 @@ def _strip_condition(ad_file: Path) -> None:
 
 async def _send_sync_report(chat_id: int, report: dict, announce: bool) -> None:
     if report["first_sync"]:
+        count = len(ad_store.online_view(chat_id)["ads"])
         await BOT.send_message(
-            chat_id,
-            "🔄 Erster Online-Abgleich fertig: "
-            f"{len(report['missing'])} lokal aktive Inserate fehlen online, "
-            f"{len(report['online_only'])} sind nur online vorhanden. "
-            "Details unter /inserate.",
+            chat_id, f"🔄 Abgleich fertig: {count} Inserate sind online. Details unter /inserate."
         )
         return
     for ad in report["missing"]:
         await BOT.send_message(
             chat_id,
-            f"⚠️ Nicht mehr online: {ad['title']}\nWurde es verkauft?",
+            f"ℹ️ Nicht mehr auf Kleinanzeigen: {ad['title']}",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton(
-                            "💰 Verkauft", callback_data=f"sold:{ad['key']}"
-                        ),
-                        InlineKeyboardButton(
-                            "⏸ Deaktivieren", callback_data=f"deact:{ad['key']}"
-                        ),
+                            "💰 Als verkauft eintragen", callback_data=f"sold:{ad['key']}"
+                        )
                     ]
                 ]
             ),
         )
     for ad in report["online_only"]:
-        await BOT.send_message(chat_id, f"🆕 Nur online vorhanden: {ad['title']}")
+        await BOT.send_message(chat_id, f"🆕 Neu auf Kleinanzeigen: {ad['title']}")
     for ad in report["expiring"]:
         await BOT.send_message(
             chat_id, f"⏳ Läuft am {ad['expires']} ab: {ad['title']}"
@@ -660,42 +647,38 @@ def _sync_is_stale(chat_id: int) -> bool:
     return age > SYNC_MAX_AGE
 
 
+def _state_label(state: str) -> str:
+    return ONLINE_STATE_LABELS.get(state, OTHER_STATE_LABEL)
+
+
 def _render_ad_list(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
-    view = ad_store.overview(chat_id)
-    ads = [a for a in view["ads"] if a["status"] != "sold"]
-    counts = [
-        f"{label}: {n}"
-        for status, label in STATUS_LABELS.items()
-        if (n := sum(a["status"] == status for a in view["ads"]))
-    ]
-    if view["synced_at"]:
-        checked = (
-            datetime.datetime.fromisoformat(view["synced_at"])
-            .astimezone(LUNCH_PLAN_TZ)
-            .strftime("%d.%m. %H:%M")
-        )
-        lines = [f"Stand online: {checked}"]
-    else:
-        lines = ["Noch kein Online-Abgleich erfolgreich."]
+    """List only what is on Kleinanzeigen; local files are an implementation detail."""
+    view = ad_store.online_view(chat_id)
+    if not view["synced_at"]:
+        return "Ich konnte Kleinanzeigen noch nicht abrufen. Bitte versuch es später erneut.", None
+    checked = (
+        datetime.datetime.fromisoformat(view["synced_at"])
+        .astimezone(LUNCH_PLAN_TZ)
+        .strftime("%d.%m. %H:%M")
+    )
+    lines = [f"Deine Inserate auf Kleinanzeigen (Stand {checked}): {len(view['ads'])}"]
     if not view["health"]["ok"]:
-        lines.append("⚠️ Der letzte Abgleich ist fehlgeschlagen, der Stand kann veraltet sein.")
-    lines.extend(counts)
-    if view["online_only"]:
-        lines.append("\nNur online vorhanden:")
-        lines.extend(f"• {a['title']}" for a in view["online_only"])
-    order = list(STATUS_LABELS).index
-    priority = {"missing": 0, "unknown": 1, "draft": 2}
-    ads.sort(key=lambda a: (priority.get(a["status"], 3), order(a["status"]), a["title"]))
+        lines.insert(0, "⚠️ Der letzte Abruf ist fehlgeschlagen, der Stand kann veraltet sein.")
     # Telegram allows at most 100 inline buttons per message.
+    managed = sorted((a for a in view["ads"] if a["key"]), key=lambda a: a["title"])
     rows = [
         [
             InlineKeyboardButton(
-                f"{STATUS_LABELS[a['status']].split()[0]} {a['title'][:45]}",
+                f"{_state_label(a['state']).split()[0]} {a['title'][:45]}",
                 callback_data=f"ad:{a['key']}",
             )
         ]
-        for a in ads[:100]
+        for a in managed[:100]
     ]
+    unmanaged = [a for a in view["ads"] if not a["key"]]
+    if unmanaged:
+        lines.append("\nNoch nicht bearbeitbar, kommt beim nächsten Abgleich:")
+        lines.extend(f"• {a['title']}" for a in unmanaged)
     return "\n".join(lines), InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -711,10 +694,10 @@ async def _show_ad_list(chat_id: int) -> None:
 
 
 async def cmd_inserate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all ads with their online status; tapping one opens its actions."""
+    """Show the ads on Kleinanzeigen; tapping one opens its actions."""
     chat_id = update.effective_chat.id
-    if not ad_store.list_local_ads(chat_id) and not KLEINANZEIGEN_BOT_CMD:
-        await update.message.reply_text("Keine lokalen Inserate gefunden.")
+    if not KLEINANZEIGEN_BOT_CMD:
+        await update.message.reply_text("Der Zugriff auf Kleinanzeigen ist nicht eingerichtet.")
         return
     if _sync_is_stale(chat_id):
         await update.message.reply_text("🔍 Prüfe den Stand auf Kleinanzeigen…")
@@ -722,24 +705,22 @@ async def cmd_inserate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.application.create_task(_show_ad_list(chat_id))
 
 
-def _ad_actions(entry: dict) -> InlineKeyboardMarkup | None:
-    key, status = entry["key"], entry["status"]
-    sold = InlineKeyboardButton("💰 Verkauft", callback_data=f"sold:{key}")
-    delete = InlineKeyboardButton("🗑 Online löschen", callback_data=f"del:{key}")
-    deactivate = InlineKeyboardButton("⏸ Lokal deaktivieren", callback_data=f"deact:{key}")
-    reactivate = InlineKeyboardButton("▶️ Lokal aktivieren", callback_data=f"react:{key}")
-    match status:
-        case "online" | "reserved":
-            rows = [[sold, delete]]
-            rows.append([deactivate if entry["local_active"] else reactivate])
-        case "missing" | "unknown":
-            rows = [[sold, deactivate]]
-        case "draft":
-            rows = [[deactivate]]
-        case "inactive":
-            rows = [[reactivate]]
-        case _:
-            return None
+def _ad_actions(entry: dict) -> InlineKeyboardMarkup:
+    key = entry["key"]
+    rows = [
+        [
+            InlineKeyboardButton("💰 Verkauft", callback_data=f"sold:{key}"),
+            InlineKeyboardButton("🗑 Löschen", callback_data=f"del:{key}"),
+        ]
+    ]
+    if entry["state"] == "active":
+        rows.append(
+            [
+                InlineKeyboardButton("⏸ Nicht mehr neu schalten", callback_data=f"deact:{key}")
+                if entry["auto_republish"]
+                else InlineKeyboardButton("▶️ Wieder neu schalten", callback_data=f"react:{key}")
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -1090,7 +1071,7 @@ async def handle_delete_job(job_data: dict) -> tuple[bool, str]:
         await _store_online_snapshot(chat_id, online)
     if is_sale:
         return True, f"💰 Als verkauft eingetragen: {ad.title}"
-    return True, f"✅ Nicht mehr online und lokal deaktiviert: {ad.title}"
+    return True, f"✅ Von Kleinanzeigen gelöscht: {ad.title}"
 
 
 async def handle_republish_job(job_data: dict) -> tuple[bool, str]:
@@ -1180,13 +1161,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if action == "ad":
-            view = ad_store.overview(chat_id)
-            entry = next(a for a in view["ads"] if a["key"] == ad_key)
-            expires = f"\nLäuft ab: {entry['expires']}" if entry["expires"] else ""
+            view = ad_store.online_view(chat_id)
+            entry = next((a for a in view["ads"] if a["key"] == ad_key), None)
+            if not entry:
+                await context.bot.send_message(
+                    chat_id, f"«{ad.title}» ist nicht mehr auf Kleinanzeigen."
+                )
+                return
+            expires = f"\nLäuft ab: {entry['expires']}" if entry["expires"] != "-" else ""
+            republish = (
+                "\nWird automatisch neu geschaltet: "
+                f"{'ja' if entry['auto_republish'] else 'nein'}"
+                if entry["state"] == "active"
+                else ""
+            )
             await context.bot.send_message(
                 chat_id,
-                f"{ad.title}\nPreis: {ad.price} EUR\n"
-                f"Status: {STATUS_LABELS[entry['status']]}{expires}",
+                f"{entry['title']}\nStatus: {_state_label(entry['state'])}{expires}{republish}",
                 reply_markup=_ad_actions(entry),
             )
             return
@@ -1219,9 +1210,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id, f"Fehler: {e}")
                 return
             text = (
-                "▶️ Lokal aktiviert."
+                "▶️ Wird wieder automatisch neu geschaltet."
                 if action == "react"
-                else "⏸ Lokal deaktiviert. Online ändert das nichts."
+                else "⏸ Wird nicht mehr automatisch neu geschaltet, bleibt aber online."
             )
             await context.bot.send_message(chat_id, f"{text} ({ad.title})")
         return

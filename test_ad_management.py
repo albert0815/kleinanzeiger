@@ -536,15 +536,51 @@ class MainFlowTest(TempBase):
             with self.assertRaises(ValueError):
                 self.main.write_ad_files(draft, CHAT)
 
-    def test_ad_list_renders_within_telegram_limits(self):
-        for i in range(120):
-            write_ad(self.base, f"ad{i:03}", ad_id=i + 1, title="Sehr langer Titel " * 5)
-        ad_store.apply_sync(CHAT, [])
+    def test_ad_list_shows_only_what_is_online(self):
+        write_ad(self.base, "a", ad_id=1, title="Lokaler Titel")
+        write_ad(self.base, "weg", ad_id=2, title="Nicht mehr online")
+        write_ad(self.base, "entwurf", title="Entwurf")
+        write_ad(self.base, "aus", ad_id=3, active=False, title="Aus")
+        ad_store.apply_sync(
+            CHAT,
+            [
+                OnlineAd("1", "Echter Titel", "active", "06.12.2026"),
+                OnlineAd("3", "Aus", "reserved", "-"),
+                OnlineAd("9", "Ohne Datei", "active", "-"),
+            ],
+        )
         text, markup = self.main._render_ad_list(CHAT)
+        labels = [b.text for row in markup.inline_keyboard for b in row]
+        self.assertEqual(labels, ["🟡 Aus", "🟢 Echter Titel"])
+        self.assertIn("Ohne Datei", text)
+        self.assertNotIn("Nicht mehr online", text + "".join(labels))
+        self.assertNotIn("lokal", (text + "".join(labels)).lower())
+
+    def test_ad_list_before_first_sync_claims_nothing(self):
+        write_ad(self.base, "a", ad_id=1)
+        text, markup = self.main._render_ad_list(CHAT)
+        self.assertIsNone(markup)
+        self.assertIn("noch nicht abrufen", text)
+
+    def test_ad_list_within_telegram_limits(self):
+        for i in range(120):
+            write_ad(self.base, f"ad{i:03}", ad_id=i + 1, title="T")
+        ad_store.apply_sync(
+            CHAT, [OnlineAd(str(i + 1), "Sehr langer Titel " * 5, "active", "-") for i in range(120)]
+        )
+        _, markup = self.main._render_ad_list(CHAT)
         buttons = [b for row in markup.inline_keyboard for b in row]
         self.assertEqual(len(buttons), 100)
         self.assertTrue(all(len(b.callback_data.encode()) <= 64 for b in buttons))
-        self.assertIn("fehlt online", text)
+
+    def test_actions_offer_republish_toggle_only_for_active_ads(self):
+        def labels(state, auto):
+            entry = {"key": "k", "state": state, "auto_republish": auto}
+            return [b.text for r in self.main._ad_actions(entry).inline_keyboard for b in r]
+
+        self.assertIn("⏸ Nicht mehr neu schalten", labels("active", True))
+        self.assertIn("▶️ Wieder neu schalten", labels("active", False))
+        self.assertEqual(labels("reserved", False), ["💰 Verkauft", "🗑 Löschen"])
 
 
 if __name__ == "__main__":

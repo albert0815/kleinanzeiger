@@ -25,7 +25,6 @@ from strands.agent.conversation_manager import SlidingWindowConversationManager
 
 from skills import BASE_SYSTEM_PROMPT, build_skills_plugin
 from tools import (
-    deactivate_kleinanzeigen_ad,
     delete_kleinanzeigen_ad,
     get_current_date,
     get_lunch_plan,
@@ -35,6 +34,7 @@ from tools import (
     refresh_kleinanzeigen_status,
     save_lunch_plan,
     search_kleinanzeigen_categories,
+    set_kleinanzeigen_auto_republish,
 )
 
 log = logging.getLogger("kleinanzeigen-agent.registry")
@@ -54,7 +54,7 @@ _TOOLS = [
     search_kleinanzeigen_categories,
     delete_kleinanzeigen_ad,
     mark_kleinanzeigen_ad_sold,
-    deactivate_kleinanzeigen_ad,
+    set_kleinanzeigen_auto_republish,
 ]
 
 # chat_id -> Agent

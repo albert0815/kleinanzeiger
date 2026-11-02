@@ -1,7 +1,7 @@
 ---
 name: kleinanzeigen
 description: Kleinanzeigen.de-Inserate aus Fotos erstellen, veröffentlichen und verwalten.
-allowed-tools: list_kleinanzeigen_ads, refresh_kleinanzeigen_status, search_kleinanzeigen_categories, delete_kleinanzeigen_ad, mark_kleinanzeigen_ad_sold, deactivate_kleinanzeigen_ad
+allowed-tools: list_kleinanzeigen_ads, refresh_kleinanzeigen_status, search_kleinanzeigen_categories, delete_kleinanzeigen_ad, mark_kleinanzeigen_ad_sold, set_kleinanzeigen_auto_republish
 ---
 
 ## Kleinanzeigen-Inserate
@@ -40,15 +40,18 @@ Antworte auf Inserate-Anfragen NUR mit dem JSON, keine Markdown-Codefences, kein
 ### Inserate verwalten
 Diese Regel zum JSON gilt nicht für die Verwaltung bestehender Inserate. Dort antwortest du normal.
 
-1. **Auflisten**: Rufe `list_kleinanzeigen_ads()` auf. Nenne Titel, Preis, Status und den
-   Zeitpunkt des letzten Online-Abgleichs. Weise auf `missing`, `online_only` und bald
-   ablaufende Inserate hin. Online-Inserate werden beim Abgleich automatisch übernommen,
-   `online_only` enthält nur solche, bei denen das noch nicht geklappt hat. Ist `health.ok` falsch, sage das klar.
+Zeige nur, was wirklich auf Kleinanzeigen ist. Sprich nie von lokalen Dateien oder
+einem lokalen Status.
+
+1. **Auflisten**: Rufe `list_kleinanzeigen_ads()` auf. Nenne Titel, Status und den
+   Zeitpunkt des letzten Abgleichs. Preise kennst du hier nicht, nenne also keine.
+   Ist `health.ok` falsch, sage das klar.
 2. **Aktualisieren**: Ist der Abgleich alt oder wünscht es der Nutzer, rufe
    `refresh_kleinanzeigen_status()` auf. Das Ergebnis meldet der Bot selbst.
 3. **Verkauft**: `mark_kleinanzeigen_ad_sold(ad_key=...)`.
 4. **Löschen**: `delete_kleinanzeigen_ad(ad_key=...)`.
-5. **Deaktivieren** (nur lokal, bleibt online): `deactivate_kleinanzeigen_ad(ad_key=...)`.
+5. **Automatisches Neuschalten**: `set_kleinanzeigen_auto_republish(ad_key=..., enabled=...)`.
+   Das Inserat bleibt dabei online.
 
 Bei Verkauft und Löschen fragt der Bot per Button nach. Sage erst danach, dass etwas
 ausgeführt wurde. Passen mehrere Inserate, frage nach, welches gemeint ist.

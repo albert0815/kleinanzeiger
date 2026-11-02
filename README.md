@@ -109,7 +109,7 @@ The bot will:
 
 - `/start` or `/help` - Show welcome message
 - `/neu` - Discard current draft and start fresh
-- `/inserate` - Show ads with their online status; tap an ad for its actions
+- `/inserate` - Show the ads on Kleinanzeigen; tap an ad for its actions
 - `/queue` - Check queue status (pending/backout jobs)
 - `/backout` - List failed jobs for this chat
 - `/retry_<job_id>` - Retry a specific failed job
@@ -122,7 +122,8 @@ The bot keeps a snapshot of what is online in `<base>/<chat_id>/agent-state.json
 It is refreshed by `/inserate` when older than 15 minutes, after every change made
 through the bot, on request in the chat, and twice a day at slightly varying times.
 Ads created outside the agent, for example in the app, are downloaded into `ads/` and
-managed like all others. To keep one from being republished, deactivate it locally.
+managed like all others. `/inserate` only shows what is on Kleinanzeigen. Each ad can be
+excluded from automatic republishing there.
 You are told once about new differences and once when access fails or recovers.
 
 ## Republishing
