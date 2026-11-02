@@ -1,50 +1,38 @@
 ---
 name: lunch-planning
-description: Mittagessen planen, Wochenvorschläge erstellen und im System speichern.
-allowed-tools: get_current_date get_recipes get_lunch_plan save_lunch_plan
+description: Mittagessen abfragen, planen und ändern sowie die Einkaufsliste in Mahlino befüllen.
+allowed-tools: get_current_date get_lunch_plan get_lunch_planning_data propose_lunch_plan add_to_shopping_list add_lunches_to_shopping_list
 ---
 
 ## Mittagessen-Planung
 
-### Wochentag-Regeln
-- Dienstags kocht Mama. Plane für Dienstag **niemals** ein Rezept ein und speichere
-  auch keinen Eintrag. Weise in der Vorschlagsliste explizit darauf hin:
-  "Dienstag: Mama kocht 👩‍🍳"
+Rufe bei allem, was Datumsangaben betrifft, zuerst get_current_date auf.
+
+### Wichtig zum Speichern
+Du kannst selbst nichts im Essensplan speichern. Du schlägst nur mit propose_lunch_plan vor,
+der Bot zeigt den Vorschlag dem Haushalt mit Buttons. Sagt jemand „Ja“ oder „Speichern“,
+verweise auf den Button „Annehmen & speichern“. Behaupte nie, etwas sei gespeichert.
+
+### Wochentag-Regel
+Dienstags kocht Mama. Plane dafür nie ein Rezept ein. Weise in deiner Antwort kurz darauf hin.
 
 ### Wochenplanung
-Wenn kein Mittagessen für morgen geplant ist, erstelle einen Vorschlag für die fehlenden
-Tage ab heute + 7 Tage (nur Tage ohne bestehenden Eintrag – keine bereits geplanten Tage
-überschreiben).
+1. Rufe get_lunch_planning_data für heute bis in 7 Tagen auf.
+2. Wähle für jeden Tag aus free_days ein Rezept aus candidates:
+   a. Abwechslung: Bevorzuge Rezepte, die lange nicht dran waren.
+   b. Dauer: Mo-Fr eher unter 45 Minuten, am Wochenende auch aufwändiger. Ist minutes
+      leer, schätze anhand des Namens.
+   c. Vielfalt: Mische verschiedene Arten von Gerichten über die Woche.
+   d. Saison: Bei sonst gleichwertigen Optionen bevorzuge saisonale Zutaten (Mitteleuropa).
+3. Rufe propose_lunch_plan auf. Antworte danach mit höchstens einem Satz.
 
-Vorgehensweise:
-1. Rufe get_current_date auf, um das heutige Datum zu kennen.
-2. Rufe get_lunch_plan einmalig auf: startDate = heute minus 84 Tage, endDate = Ende der
-   nächsten Woche (nächster Sonntag). Diese Antwort liefert gleichzeitig:
-   - Die bestehenden Einträge der nächsten Woche (werden nicht überschrieben)
-   - Den vollständigen Verlauf der letzten 12 Wochen für die Abwechslungsprüfung
-3. Rufe get_recipes auf, um alle verfügbaren Rezepte zu laden.
-4. Wähle Rezepte für die Tage aus nach diesen Kriterien (Priorität absteigend):
-   a. Abwechslung: Prüfe den Verlauf aus Schritt 2. Gerichte, die in den letzten 2 Wochen
-      vorkamen, möglichst vermeiden. Gerichte aus den letzten 4 Wochen nur wenn nötig.
-      Das Feld lastPlanDate in den Rezeptdaten dient als zusätzlicher Hinweis, aber der
-      tatsächliche Verlauf aus Schritt 2 hat Vorrang.
-   b. Wähle für Wochentags (Mo-Fr) eher einfache, schnelle Rezepte, für das Wochenende 
-      auch aufwändigere Gerichte. Du kannst als Hinweis hierzu auch die letzten Wochen betrachten.
-   c. Vielfalt: Mische verschiedene Arten von Gerichten (z.B. Suppe, Pasta, Auflauf) über die Woche.
-   d. Saisonalität: Bei sonst gleichwertigen Optionen bevorzuge saisonale Zutaten
-      (Mitteleuropa). Dies ist ein optionaler Tiebreaker, kein Pflichtkriterium.
-5. Präsentiere den Vorschlag als übersichtliche Liste (Tag + Rezeptname).
-6. Warte auf Bestätigung des Nutzers, bevor du speicherst.
-   Speichere NIEMALS ohne explizite Bestätigung ("Annehmen", "Ja", "OK", "Speichern").
+Sind keine free_days vorhanden, sage das und schlage nichts vor.
 
-### Rezeptreferenzen beim Speichern
-Beim Aufruf von save_lunch_plan übergibst du im Feld recipes eine Liste von Objekten
-mit mindestens {"id": <rezept-id>}. Übergib keine vollständigen Rezeptobjekte.
+### Änderungen
+Bei Änderungen an einem offenen Vorschlag rufst du propose_lunch_plan erneut mit allen Tagen
+auf. Für bereits geplante Tage, etwa beim Tauschen, setzt du replace=true. Schau dir dafür
+vorher mit get_lunch_plan an, was geplant ist.
 
-### Änderungswünsche
-Wenn der Nutzer einzelne Tage ändern möchte, passe den Vorschlag entsprechend an und
-zeige die aktualisierte Liste. Warte erneut auf Bestätigung.
-
-### Bestätigung und Speichern
-Erst nach expliziter Bestätigung rufst du save_lunch_plan für jeden Tag auf.
-Gib anschließend eine Zusammenfassung aus, was gespeichert wurde.
+### Einkaufsliste
+Einzelne Dinge trägst du direkt mit add_to_shopping_list ein. Die Zutaten geplanter Tage
+kommen nur auf ausdrücklichen Wunsch mit add_lunches_to_shopping_list auf die Liste, einmal pro Tag.

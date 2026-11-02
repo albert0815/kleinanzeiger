@@ -47,20 +47,17 @@ from agent_registry import get_agent, clear_agent
 def _run_tool_sanity(chat_id: int) -> None:
     """Call each tool directly and print the result."""
     import datetime
-    from tools import get_recipes, get_lunch_plan
-
-    print("\n--- get_recipes() ---")
-    try:
-        recipes = get_recipes()
-        print(f"  {len(recipes)} recipes returned")
-        if recipes:
-            r = recipes[0]
-            print(f"  First: {r.get('name')} (lastPlanDate={r.get('lastPlanDate')})")
-    except Exception as e:
-        print(f"  ERROR: {e}")
+    from tools import get_lunch_plan, get_lunch_planning_data
 
     today = datetime.date.today().isoformat()
     week = (datetime.date.today() + datetime.timedelta(days=7)).isoformat()
+    print(f"\n--- get_lunch_planning_data({today}, {week}) ---")
+    try:
+        data = get_lunch_planning_data(today, week)
+        print(f"  {len(data['free_days'])} free days, {len(data['candidates'])} candidates")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+
     print(f"\n--- get_lunch_plan({today}, {week}) ---")
     try:
         plan = get_lunch_plan(today, week)

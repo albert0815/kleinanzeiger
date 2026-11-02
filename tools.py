@@ -2,8 +2,7 @@
 
 All tools are synchronous so they work correctly when the Strands agent is
 called via asyncio.to_thread() from the Telegram asyncio event loop.
-The save_lunch_plan tool is gated: it requires agent.state["plan_confirmed"] == True,
-which is set explicitly by the Telegram confirmation handler before re-invoking the agent.
+Lunch plans can only be proposed here; saving needs a Telegram button press.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from zoneinfo import ZoneInfo
 from strands import tool
 
 import ad_store
+import lunch_plan
 import mahlino
 
 log = logging.getLogger("kleinanzeigen-agent.tools")
@@ -66,18 +66,6 @@ def get_current_date() -> dict:
     }
 
 @tool
-def get_recipes() -> list[dict]:
-    """Fetch all available (non-archived) recipes from Mahlino.
-
-    Returns a slim list; each object contains:
-    - id: unique recipe identifier (use this when saving a plan)
-    - name: recipe name
-    - lastPlanDate: ISO date string of when it was last cooked (or null)
-    """
-    return mahlino.fetch_recipes_sync()
-
-
-@tool
 def get_lunch_plan(start_date: str, end_date: str) -> list[dict]:
     """Fetch the lunch plan for a date range from Mahlino.
 
@@ -87,7 +75,8 @@ def get_lunch_plan(start_date: str, end_date: str) -> list[dict]:
 
     Returns a slim list of day-entries. Each entry contains:
     - date: ISO date string
-    - recipes: list of {id, name} for each recipe planned that day (may be empty)
+    - recipes: list of {id, name} for each entry that day (may be empty). id is
+      null for free-text entries such as "Reste".
     """
     return [
         {
@@ -104,42 +93,88 @@ def get_lunch_plan(start_date: str, end_date: str) -> list[dict]:
 
 
 @tool
-def save_lunch_plan(date: str, recipes: list[dict], **kwargs) -> str:
-    """Save a lunch plan entry for a specific date to Mahlino.
-
-    IMPORTANT: This tool must only be called after the user has explicitly confirmed
-    the plan. The confirmation is tracked in agent.state["plan_confirmed"]. If
-    confirmation is missing, this tool returns an error message instead of saving.
+def get_lunch_planning_data(start_date: str, end_date: str) -> dict:
+    """Get what is needed to plan lunches for a date range.
 
     Args:
-        date:    ISO date string, e.g. "2026-05-12"
-        recipes: list of recipe references – each must contain at least {"id": <id>}.
+        start_date: ISO date string, e.g. "2026-05-12"
+        end_date:   ISO date string, e.g. "2026-05-18"
 
-    Returns a success message or an error description.
+    Returns free_days, no_cooking_days, planned_days and candidates. Candidates
+    were not cooked recently and have id, name, lastPlanDate and minutes (total
+    time, may be null). They are sorted with the longest unused first.
     """
-    # Check agent state for confirmation flag
-    agent_context = kwargs.get("agent_context") or kwargs.get("context")
-    if agent_context is not None:
-        agent_state = getattr(agent_context, "state", None)
-        if agent_state is not None and not agent_state.get("plan_confirmed", False):
-            return (
-                "Fehler: Der Plan wurde noch nicht vom Nutzer bestätigt. "
-                "Bitte warte auf eine ausdrückliche Bestätigung (z.B. '✅ Annehmen'), "
-                "bevor du den Plan speicherst."
-            )
+    return lunch_plan.planning_data(
+        datetime.date.fromisoformat(start_date),
+        datetime.date.fromisoformat(end_date),
+        datetime.datetime.now(_TZ).date(),
+    )
 
-    slugs = []
-    for ref in recipes:
-        slug = ref.get("id")
-        if slug is None:
-            return f"Fehler: Rezept-Referenz ohne ID: {ref}"
-        slugs.append(slug)
 
-    for slug in slugs:
-        mahlino.save_lunch_entry_sync(date, slug)
+@tool
+def propose_lunch_plan(days: list[dict]) -> str:
+    """Propose new or changed lunches. Nothing is saved until a person confirms.
 
-    log.info("Saved lunch plan for %s", date)
-    return f"Plan für {date} erfolgreich gespeichert."
+    The bot shows the proposal to the household with confirmation buttons. A new
+    proposal replaces the previous open one, so always include all days.
+
+    Args:
+        days: one object per day with
+            - date: ISO date string
+            - recipe_id: recipe id, or
+            - note: free text such as "Reste"
+            - replace: true to change a day that is already planned. With
+              neither recipe_id nor note, it removes the day's lunch.
+    """
+    today = datetime.datetime.now(_TZ).date()
+    dates = [str(d.get("date")) for d in days]
+    try:
+        parsed = [datetime.date.fromisoformat(d) for d in dates]
+    except ValueError as e:
+        return f"Fehler: {e}"
+    if not parsed:
+        return "Fehler: Der Vorschlag enthält keine Tage."
+    result = lunch_plan.validate_days(
+        days,
+        today,
+        mahlino.fetch_recipes_sync(),
+        mahlino.fetch_plan_sync(min(parsed), max(parsed)),
+    )
+    if isinstance(result, str):
+        return f"Fehler: {result}"
+    lunch_plan.store_proposal(result)
+    return (
+        "Der Vorschlag wurde angelegt. Der Bot zeigt ihn gleich mit Buttons an. "
+        "Wiederhole die Liste nicht und sage nicht, dass etwas gespeichert ist."
+    )
+
+
+@tool
+def add_to_shopping_list(text: str, quantity: float | None = None, unit: str | None = None) -> str:
+    """Add one item the user named to the Mahlino shopping list.
+
+    Args:
+        text: the item, e.g. "Milch"
+        quantity: optional amount
+        unit: optional unit, e.g. "l"
+    """
+    mahlino.add_shopping_item_sync(text, quantity, unit)
+    return f"{text} steht auf der Einkaufsliste."
+
+
+@tool
+def add_lunches_to_shopping_list(days: list[str]) -> str:
+    """Add the ingredients of the planned lunches to the shopping list.
+
+    Only call this when the user asks. Calling it twice adds the items twice.
+
+    Args:
+        days: ISO date strings
+    """
+    for day in days:
+        datetime.date.fromisoformat(day)
+    mahlino.add_days_to_shopping_list_sync(days)
+    return f"Zutaten für {len(days)} Tage stehen auf der Einkaufsliste."
 
 
 # ---------------------------------------------------------------------------
