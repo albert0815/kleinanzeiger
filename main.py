@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -148,6 +148,17 @@ CHAT_PHOTO_POOL: dict[int, list[bytes]] = {}
 ACTIVE_GENERATION_TASKS: dict[int, asyncio.Task] = {}
 
 BOT = None  # set in main(); job handlers have no callback context
+
+# Shown in Telegram's command menu and in /start.
+BOT_COMMANDS = [
+    BotCommand("inserate", "Inserate mit Online-Status anzeigen und verwalten"),
+    BotCommand("neu", "Entwurf verwerfen und Konversation zurücksetzen"),
+    BotCommand("lunch", "Heutiges Mittagessen anzeigen"),
+    BotCommand("plan", "Essensplan für nächste Woche vorschlagen"),
+    BotCommand("queue", "Status der Warteschlange anzeigen"),
+    BotCommand("backout", "Fehlgeschlagene Aufträge anzeigen und wiederholen"),
+    BotCommand("help", "Hilfe und alle Befehle anzeigen"),
+]
 
 # chat_ids that have a pending lunch plan suggestion awaiting confirmation
 PENDING_LUNCH_PLAN: set[int] = set()
@@ -635,20 +646,18 @@ async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    commands = "\n".join(f"/{c.command} — {c.description}" for c in BOT_COMMANDS)
     await update.message.reply_text(
         "Hallo! Ich kann zwei Dinge:\n\n"
-        "📸 *Kleinanzeigen-Inserate* — Schick mir ein Foto (oder mehrere als Album) "
-        "von dem Gegenstand, den du verkaufen willst.\n\n"
-        "🍽️ *Mittagessen-Planung* — Jeden Morgen um 08:30 schicke ich dir den "
-        "aktuellen Essensplan. Falls für die nächste Woche noch etwas fehlt, "
-        "schlage ich einen Plan vor.\n\n"
-        "Befehle:\n"
-        "/inserate — Aktive Inserate verwalten\n"
-        "/lunch — Heutiges Mittagessen anzeigen\n"
-        "/plan — Essensplan für nächste Woche vorschlagen\n"
-        "/neu — Konversation zurücksetzen\n"
-        "/queue — Warteschlangen-Status",
-        parse_mode=ParseMode.MARKDOWN,
+        "📸 Kleinanzeigen-Inserate\n"
+        "Schick mir ein Foto oder ein Album, dann erstelle ich einen Entwurf. "
+        "Ich gleiche deine Inserate außerdem mit Kleinanzeigen ab, auch solche "
+        "aus der App, und schalte sie regelmäßig neu. Im Chat kannst du z. B. "
+        "schreiben: „Das Fahrrad ist verkauft“.\n\n"
+        "🍽️ Mittagessen-Planung\n"
+        "Jeden Morgen um 08:30 schicke ich dir den aktuellen Essensplan. Falls für "
+        "die nächste Woche noch etwas fehlt, schlage ich einen Plan vor.\n\n"
+        f"Befehle:\n{commands}"
     )
 
 
@@ -1380,6 +1389,7 @@ def main() -> None:
     # Register post_init to start the background worker
     async def post_init(app: Application) -> None:
         await BACKGROUND_WORKER.start()
+        await app.bot.set_my_commands(BOT_COMMANDS)
         loop = asyncio.get_running_loop()
 
         def request_confirmation(chat_id: int, action: str, ad: ad_store.LocalAd) -> None:
