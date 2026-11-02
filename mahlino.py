@@ -166,3 +166,14 @@ def add_days_to_shopping_list_sync(days: list[str]) -> None:
         timeout=_TIMEOUT,
     )
     resp.raise_for_status()
+
+
+def create_recipe_sync(recipe: dict) -> dict:
+    resp = httpx.post(
+        f"{MAHLINO_URL}/api/v1/recipes",
+        json=recipe,
+        headers=_headers(),
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
