@@ -17,6 +17,8 @@ jobs:
 
       - name: Build image (PR validation only)
         if: github.event_name == 'pull_request'
+        env:
+          COMPOSE_BAKE: "true"
         run: docker compose build
 
       - name: Write .env file
