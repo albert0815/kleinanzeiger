@@ -510,6 +510,11 @@ class MainFlowTest(TempBase):
             self.assertTrue(asyncio.run(self.main.sync_account(CHAT)))
         self.assertEqual(len(ad_store.overview(CHAT)["online_only"]), 1)
 
+    def test_command_menu_matches_registered_handlers(self):
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        for command in self.main.BOT_COMMANDS:
+            self.assertIn(f'CommandHandler("{command.command}"', source)
+
     def test_failed_sync_is_reported_once_and_recovery_once(self):
         failure = bot_runner.BotFailure("login", "x")
         with mock.patch.object(bot_runner, "list_online", mock.AsyncMock(side_effect=failure)):
