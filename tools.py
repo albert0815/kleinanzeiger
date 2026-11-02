@@ -17,9 +17,10 @@ import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import httpx
 import yaml
 from strands import tool
+
+import mahlino
 
 log = logging.getLogger("kleinanzeigen-agent.tools")
 
@@ -79,16 +80,6 @@ def _set_active_flag(ad_file: Path, *, active: bool) -> None:
 
 _TZ = ZoneInfo("Europe/Berlin")
 
-LUNCH_PLAN_BASE_URL = os.environ.get(
-    "LUNCH_PLAN_URL",
-    "http://ubuntu.fritz.box:880/resources/plan",
-)
-RECIPES_URL = os.environ.get(
-    "LUNCH_RECIPES_URL",
-    "http://ubuntu.fritz.box:880/resources/recipes",
-)
-
-
 # ---------------------------------------------------------------------------
 # Date / time
 # ---------------------------------------------------------------------------
@@ -116,35 +107,21 @@ def get_current_date() -> dict:
         "weekday_en": now.strftime("%A"),
     }
 
-def _fetch_all_recipes() -> list[dict]:
-    """Internal helper – returns full recipe objects including hidden ones."""
-    with httpx.Client(timeout=15) as client:
-        resp = client.get(RECIPES_URL, headers={"Accept": "application/json"})
-        resp.raise_for_status()
-        return resp.json()
-
-
 @tool
 def get_recipes() -> list[dict]:
-    """Fetch all available (non-hidden) recipes from the recipe API.
+    """Fetch all available (non-archived) recipes from Mahlino.
 
-    Hidden recipes are excluded. Returns a slim list; each object contains:
-    - id: unique recipe identifier
+    Returns a slim list; each object contains:
+    - id: unique recipe identifier (use this when saving a plan)
     - name: recipe name
-    - category: e.g. "Hauptgericht", "Suppe"
-    - lastPlanDate: ISO date string of when it was last planned (or null)
+    - lastPlanDate: ISO date string of when it was last cooked (or null)
     """
-    keep_keys = {"id", "name", "category", "lastPlanDate"}
-    return [
-        {k: v for k, v in recipe.items() if k in keep_keys}
-        for recipe in _fetch_all_recipes()
-        if not recipe.get("hide", False)
-    ]
+    return mahlino.fetch_recipes_sync()
 
 
 @tool
 def get_lunch_plan(start_date: str, end_date: str) -> list[dict]:
-    """Fetch the meal plan for a date range from the plan API.
+    """Fetch the lunch plan for a date range from Mahlino.
 
     Args:
         start_date: ISO date string, e.g. "2026-05-12"
@@ -154,27 +131,23 @@ def get_lunch_plan(start_date: str, end_date: str) -> list[dict]:
     - date: ISO date string
     - recipes: list of {id, name} for each recipe planned that day (may be empty)
     """
-    url = f"{LUNCH_PLAN_BASE_URL}?startDate={start_date}&endDate={end_date}"
-    with httpx.Client(timeout=15) as client:
-        resp = client.get(url, headers={"Accept": "application/json"})
-        resp.raise_for_status()
-        data = resp.json()
-    entries = data if isinstance(data, list) else [data]
     return [
         {
-            "date": entry.get("date"),
+            "date": entry["date"],
             "recipes": [
-                {"id": r.get("id"), "name": r.get("name")}
-                for r in entry.get("recipes", [])
+                {"id": r["id"], "name": r["name"]} for r in entry["recipes"]
             ],
         }
-        for entry in entries
+        for entry in mahlino.fetch_plan_sync(
+            datetime.date.fromisoformat(start_date),
+            datetime.date.fromisoformat(end_date),
+        )
     ]
 
 
 @tool
 def save_lunch_plan(date: str, recipes: list[dict], **kwargs) -> str:
-    """Save a meal plan entry for a specific date to the plan API.
+    """Save a lunch plan entry for a specific date to Mahlino.
 
     IMPORTANT: This tool must only be called after the user has explicitly confirmed
     the plan. The confirmation is tracked in agent.state["plan_confirmed"]. If
@@ -183,7 +156,6 @@ def save_lunch_plan(date: str, recipes: list[dict], **kwargs) -> str:
     Args:
         date:    ISO date string, e.g. "2026-05-12"
         recipes: list of recipe references – each must contain at least {"id": <id>}.
-                 The tool resolves the full recipe objects internally before saving.
 
     Returns a success message or an error description.
     """
@@ -198,26 +170,15 @@ def save_lunch_plan(date: str, recipes: list[dict], **kwargs) -> str:
                 "bevor du den Plan speicherst."
             )
 
-    # Resolve full recipe objects by ID (includes hidden recipes)
-    all_recipes = {r["id"]: r for r in _fetch_all_recipes()}
-    resolved = []
+    slugs = []
     for ref in recipes:
-        rid = ref.get("id")
-        if rid is None:
+        slug = ref.get("id")
+        if slug is None:
             return f"Fehler: Rezept-Referenz ohne ID: {ref}"
-        full = all_recipes.get(rid)
-        if full is None:
-            return f"Fehler: Rezept mit ID {rid} nicht gefunden."
-        resolved.append(full)
+        slugs.append(slug)
 
-    payload = {"date": date, "recipes": resolved}
-    with httpx.Client(timeout=15) as client:
-        resp = client.post(
-            LUNCH_PLAN_BASE_URL,
-            json=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-        resp.raise_for_status()
+    for slug in slugs:
+        mahlino.save_lunch_entry_sync(date, slug)
 
     log.info("Saved lunch plan for %s", date)
     return f"Plan für {date} erfolgreich gespeichert."

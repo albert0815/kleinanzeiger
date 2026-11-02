@@ -15,6 +15,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git binutils build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Invalidates the cached clone below whenever the upstream branch moves;
+# otherwise a rebuild keeps reusing the old kleinanzeigen-bot from the build cache.
+ADD https://api.github.com/repos/Second-Hand-Friends/kleinanzeigen-bot/git/refs/heads/${KLEINANZEIGEN_BOT_REF} /tmp/kleinanzeigen-bot-ref.json
+
 RUN pip install --no-cache-dir pdm \
     && git clone --depth 1 --branch "${KLEINANZEIGEN_BOT_REF}" \
        https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git /opt/kleinanzeigen-bot-src
@@ -61,7 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 # Copy application source
-COPY --chown=appuser main.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ./
+COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ./
 COPY --chown=appuser skills/ ./skills/
 
 USER appuser

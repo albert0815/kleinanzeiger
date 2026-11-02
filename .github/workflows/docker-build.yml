@@ -17,6 +17,8 @@ jobs:
 
       - name: Build image (PR validation only)
         if: github.event_name == 'pull_request'
+        env:
+          COMPOSE_BAKE: "true"
         run: docker compose build
 
       - name: Write .env file
@@ -25,11 +27,14 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          MAHLINO_API_KEY: ${{ secrets.MAHLINO_API_KEY }}
         run: |
           {
             echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
             echo "AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}"
             echo "ALLOWED_USERS=${ALLOWED_USERS}"
+            echo "MAHLINO_URL=http://ubuntu.fritz.box:8000"
+            echo "MAHLINO_API_KEY=${MAHLINO_API_KEY}"
             echo "KLEINANZEIGEN_BOT_CMD=/usr/local/bin/kleinanzeigen"
             echo "KLEINANZEIGEN_BASE_DIR=/docker-volumes/kleinanzeiger/kleinanzeigen-config"
             # nodriver's Chrome DevTools connect-retry loop (see scripts/patch_nodriver_connect_timeout.py);
