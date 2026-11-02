@@ -128,6 +128,48 @@ class BuildTest(unittest.TestCase):
         )
 
 
+class PanelRulesTest(unittest.TestCase):
+    """Rules from RecipeScreen.kt in the kitchen panel."""
+
+    def test_lines_become_clean_steps(self):
+        steps, link = recipes.clean_instructions(
+            "1. **Schälen**\n\n2) Kochen\n- Salzen\n• Rühren\n## Für die Soße:\nTipp: Heiß servieren\n"
+        )
+        self.assertEqual(
+            steps, "Schälen\nKochen\nSalzen\nRühren\nFür die Soße:\nTipp: Heiß servieren"
+        )
+        self.assertIsNone(link)
+
+    def test_link_moves_to_source(self):
+        result = recipe(instructions="https://rezept.example/x")
+        self.assertIsNone(result["instructions"])
+        self.assertEqual(result["source_url"], "https://rezept.example/x")
+
+    def test_link_between_steps_is_removed_and_given_source_wins(self):
+        result = recipe(instructions="Kochen\nhttps://b.example/\nEssen", source_url="https://a.example/")
+        self.assertEqual(result["instructions"], "Kochen\nEssen")
+        self.assertEqual(result["source_url"], "https://a.example/")
+
+    def test_preview_matches_panel(self):
+        steps = recipes.format_steps(
+            "Für die Soße:\nZwiebeln schneiden\nTipp: Heiß servieren\nAnbraten\n"
+            "Diese sehr lange Zeile endet mit Doppelpunkt und ist keine Überschrift:"
+        )
+        self.assertEqual(
+            steps,
+            [
+                "\nFür die Soße",
+                "1. Zwiebeln schneiden",
+                "💡 Tipp: Heiß servieren",
+                "2. Anbraten",
+                "3. Diese sehr lange Zeile endet mit Doppelpunkt und ist keine Überschrift:",
+            ],
+        )
+
+    def test_description_is_one_paragraph(self):
+        self.assertEqual(recipe(description="Lecker\n\n  und   schnell")["description"], "Lecker und schnell")
+
+
 class ProposalTest(Base):
     def test_saved_once(self):
         proposal = recipes.store_proposal(1, recipe())

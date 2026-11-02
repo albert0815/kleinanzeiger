@@ -27,6 +27,9 @@ MAX_REDIRECTS = 4
 _TIMEOUT = 15
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36"
 _LOCK = threading.Lock()
+_MARKUP = re.compile(r"\*\*|__|^\s*#+\s*|`", re.MULTILINE)
+_LIST_PREFIX = re.compile(r"^(\d+[.)]|-|•|\*)\s+")
+_TIP_PREFIX = re.compile(r"^(unser tipp|tipp|hinweis|achtung|info)\s*:", re.IGNORECASE)
 _JSON_LD = re.compile(
     r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", re.DOTALL | re.IGNORECASE
 )
@@ -173,6 +176,28 @@ def _write(proposals: dict) -> None:
     temporary.replace(_path())
 
 
+def clean_instructions(text: str | None) -> tuple[str | None, str | None]:
+    """Prepare instructions for the kitchen panel. Returns (instructions, link).
+
+    The panel (RecipeScreen.kt) treats every line as one automatically numbered
+    step, so own numbering and blank lines must go and markup would show up as
+    is. "Tipp:" & co. become a hint box, a short line ending in ":" a heading.
+    A bare link would replace the steps with an embedded web page, so links are
+    kept apart for source_url.
+    """
+    lines, links = [], []
+    for raw in (text or "").splitlines():
+        line = _MARKUP.sub("", raw).strip()
+        line = _LIST_PREFIX.sub("", line).strip()
+        if not line:
+            continue
+        if line.startswith("http"):
+            links.append(line.split()[0])
+            continue
+        lines.append(line)
+    return "\n".join(lines) or None, links[0] if links else None
+
+
 def _clean_ingredient(item: dict) -> dict:
     text = str(item.get("text") or "").strip()
     if not text or len(text) > 200:
@@ -205,20 +230,22 @@ def build_recipe(
         raise RecipeError("Das Rezept braucht einen Titel mit höchstens 200 Zeichen.")
     if not ingredients:
         raise RecipeError("Das Rezept braucht mindestens eine Zutat.")
+    for minutes in (prep_minutes, cook_minutes):
+        if minutes is not None and not 0 <= minutes <= 6000:
+            raise RecipeError("Die Zeitangabe ist ungültig.")
+    steps, link = clean_instructions(instructions)
+    source_url = source_url or link
     if source_url and (
         len(source_url) > 500 or urlsplit(source_url).scheme not in ("http", "https")
     ):
         raise RecipeError("Der Quell-Link ist ungültig.")
-    for minutes in (prep_minutes, cook_minutes):
-        if minutes is not None and not 0 <= minutes <= 6000:
-            raise RecipeError("Die Zeitangabe ist ungültig.")
     return {
         "title": title,
-        "description": (description or "").strip()[:1000] or None,
+        "description": " ".join((description or "").split())[:1000] or None,
         "servings": servings if servings and servings >= 1 else 4,
         "prep_minutes": prep_minutes,
         "cook_minutes": cook_minutes,
-        "instructions": (instructions or "").strip() or None,
+        "instructions": steps,
         "source_url": source_url or None,
         "ingredients": [_clean_ingredient(i) for i in ingredients],
     }
@@ -275,10 +302,24 @@ def save_proposal(chat_id: int, proposal_id: str) -> dict | None:
         raise
 
 
+def format_steps(instructions: str) -> list[str]:
+    """Show the steps the way the kitchen panel will."""
+    lines, number = [], 0
+    for line in instructions.splitlines():
+        if _TIP_PREFIX.match(line):
+            lines.append(f"💡 {line}")
+        elif len(line) < 40 and line.endswith(":"):
+            lines.append(f"\n{line[:-1].rstrip()}")
+        else:
+            number += 1
+            lines.append(f"{number}. {line}")
+    return lines
+
+
 def format_proposal(recipe: dict, limit: int = 3500) -> str:
     times = [
         f"{label} {value} min"
-        for label, value in (("Vorbereitung", recipe["prep_minutes"]), ("Kochen", recipe["cook_minutes"]))
+        for label, value in (("Zubereitung", recipe["prep_minutes"]), ("Garen", recipe["cook_minutes"]))
         if value
     ]
     lines = [f"📖 Neues Rezept: {recipe['title']}", f"{recipe['servings']} Portionen"]
@@ -299,7 +340,10 @@ def format_proposal(recipe: dict, limit: int = 3500) -> str:
         note = f" ({item['note']})" if item["note"] else ""
         lines.append(f"• {amount + ' ' if amount else ''}{item['text']}{note}")
     if recipe["instructions"]:
-        lines.append(f"\nZubereitung:\n{recipe['instructions']}")
+        lines.append("\nZubereitung:")
+        lines.extend(format_steps(recipe["instructions"]))
+    elif recipe["source_url"]:
+        lines.append("\nKeine eigene Anleitung: Das Panel zeigt dafür die Quellseite.")
     if recipe["source_url"]:
         lines.append(f"\nQuelle: {recipe['source_url']}")
     text = "\n".join(lines)
