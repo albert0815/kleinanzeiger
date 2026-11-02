@@ -121,9 +121,17 @@ Example: `/retry_a1b2c3d4` (use the 8-character job ID from `/backout`)
 The bot keeps a snapshot of what is online in `<base>/<chat_id>/agent-state.json`.
 It is refreshed by `/inserate` when older than 15 minutes, after every change made
 through the bot, on request in the chat, and twice a day at slightly varying times.
+Ads created outside the agent, for example in the app, are downloaded into `ads/` and
+managed like all others. To keep one from being republished, deactivate it locally.
 You are told once about new differences and once when access fails or recovers.
 
-Automatic republishing is off. Set `KLEINANZEIGEN_AUTO_REPUBLISH=true` to enable it.
+## Republishing
+
+With `KLEINANZEIGEN_AUTO_REPUBLISH=true`, a daily run republishes ads so they show up
+near the top again. Only ads that are online, active and not sold qualify, once
+`KLEINANZEIGEN_REPUBLISH_DAYS` (default 14) have passed. Each day takes at most
+1/14 of the account's ads, oldest first. Local data is refreshed from the online ad first, so
+changes made in the app survive. The run checks the new IDs online and reports the result.
 
 Run the tests with `python -m unittest test_ad_management`.
 

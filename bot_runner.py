@@ -184,8 +184,13 @@ async def publish_new(chat_id: int) -> BotResult:
     return await run_bot(chat_id, "publish", "--ads=new")
 
 
-async def publish_due(chat_id: int) -> BotResult:
-    return await run_bot(chat_id, "publish", "--ads=due")
+async def publish_ids(chat_id: int, ad_ids: list[str]) -> BotResult:
+    return await run_bot(chat_id, "publish", f"--ads={','.join(ad_ids)}")
+
+
+async def download_ids(chat_id: int, ad_ids: list[str]) -> BotResult:
+    """Fetch the online data into the separate downloaded-ads folder."""
+    return await run_bot(chat_id, "download", f"--ads={','.join(ad_ids)}")
 
 
 async def delete_online(chat_id: int, ad_id: str) -> BotResult:

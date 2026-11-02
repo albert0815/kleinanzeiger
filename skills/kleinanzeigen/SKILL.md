@@ -42,7 +42,8 @@ Diese Regel zum JSON gilt nicht für die Verwaltung bestehender Inserate. Dort a
 
 1. **Auflisten**: Rufe `list_kleinanzeigen_ads()` auf. Nenne Titel, Preis, Status und den
    Zeitpunkt des letzten Online-Abgleichs. Weise auf `missing`, `online_only` und bald
-   ablaufende Inserate hin. Ist `health.ok` falsch, sage das klar.
+   ablaufende Inserate hin. Online-Inserate werden beim Abgleich automatisch übernommen,
+   `online_only` enthält nur solche, bei denen das noch nicht geklappt hat. Ist `health.ok` falsch, sage das klar.
 2. **Aktualisieren**: Ist der Abgleich alt oder wünscht es der Nutzer, rufe
    `refresh_kleinanzeigen_status()` auf. Das Ergebnis meldet der Bot selbst.
 3. **Verkauft**: `mark_kleinanzeigen_ad_sold(ad_key=...)`.
