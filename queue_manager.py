@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Any
 
 log = logging.getLogger("kleinanzeigen-agent.queue")
+
+RETRY_DELAYS_SECONDS = (60, 300, 900)
 
 
 class JobStatus(Enum):
@@ -37,6 +40,7 @@ class QueuedJob:
     error: str | None = None
     retry_count: int = 0
     max_retries: int = 3
+    next_attempt_at: str | None = None   # Earliest retry time (UTC ISO)
 
 
 class QueueManager:
@@ -58,6 +62,8 @@ class QueueManager:
         # In-memory pending queue (loaded from disk on init)
         self.pending: dict[str, QueuedJob] = {}
         self.backout: dict[str, QueuedJob] = {}
+        # Tools enqueue from agent threads while the worker runs on the event loop.
+        self._lock = threading.RLock()
 
         self._load_from_disk()
 
@@ -72,6 +78,9 @@ class QueueManager:
                     try:
                         data = json.loads(line)
                         job = self._dict_to_job(data)
+                        # A job still "processing" was interrupted by a restart.
+                        if job.status == JobStatus.PROCESSING.value:
+                            job.status = JobStatus.PENDING.value
                         self.pending[job.job_id] = job
                     except Exception as e:
                         log.error("Failed to load pending job: %s", e)
@@ -117,6 +126,7 @@ class QueueManager:
             error=data.get("error"),
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
+            next_attempt_at=data.get("next_attempt_at"),
         )
 
     def enqueue(
@@ -135,8 +145,9 @@ class QueueManager:
             data=data,
             max_retries=max_retries,
         )
-        self.pending[job_id] = job
-        self._save_to_disk()
+        with self._lock:
+            self.pending[job_id] = job
+            self._save_to_disk()
         log.info(
             "[job=%s chat=%d] Enqueued: type=%s",
             job_id, chat_id, job_type,
@@ -145,9 +156,13 @@ class QueueManager:
 
     def get_next_job(self) -> QueuedJob | None:
         """Get the next pending job from the queue."""
-        for job in self.pending.values():
-            if job.status == JobStatus.PENDING.value:
-                return job
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            for job in self.pending.values():
+                if job.status == JobStatus.PENDING.value and (
+                    not job.next_attempt_at or job.next_attempt_at <= now
+                ):
+                    return job
         return None
 
     def mark_processing(self, job_id: str) -> bool:
@@ -209,6 +224,12 @@ class QueueManager:
         else:
             # Keep in pending for retry
             job.status = JobStatus.PENDING.value
+            delay = RETRY_DELAYS_SECONDS[
+                min(job.retry_count - 1, len(RETRY_DELAYS_SECONDS) - 1)
+            ]
+            job.next_attempt_at = (
+                datetime.utcnow() + timedelta(seconds=delay)
+            ).isoformat()
             log.warning(
                 "[job=%s chat=%d] Marked failed (retry %d/%d): %s",
                 job_id, job.chat_id, job.retry_count, job.max_retries, error,
@@ -231,6 +252,7 @@ class QueueManager:
             job.status = JobStatus.PENDING.value
             job.retry_count = 0
             job.error = None
+            job.next_attempt_at = None
             self.pending[job_id] = job
             self._save_to_disk()
             log.info("[job=%s] Retried from backout", job_id)

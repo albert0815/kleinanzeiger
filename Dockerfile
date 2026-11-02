@@ -9,19 +9,18 @@
 ######################
 FROM python:3.12-slim AS kleinanzeigen-bot-build
 
-ARG KLEINANZEIGEN_BOT_REF=main
+# Pinned on purpose; update it deliberately after testing a newer upstream commit.
+ARG KLEINANZEIGEN_BOT_REF=32cbee7d5d8ef998aa363c719f091894373d714d
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git binutils build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Invalidates the cached clone below whenever the upstream branch moves;
-# otherwise a rebuild keeps reusing the old kleinanzeigen-bot from the build cache.
-ADD https://api.github.com/repos/Second-Hand-Friends/kleinanzeigen-bot/git/refs/heads/${KLEINANZEIGEN_BOT_REF} /tmp/kleinanzeigen-bot-ref.json
-
 RUN pip install --no-cache-dir pdm \
-    && git clone --depth 1 --branch "${KLEINANZEIGEN_BOT_REF}" \
-       https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git /opt/kleinanzeigen-bot-src
+    && git init /opt/kleinanzeigen-bot-src \
+    && git -C /opt/kleinanzeigen-bot-src fetch --depth 1 \
+       https://github.com/Second-Hand-Friends/kleinanzeigen-bot.git "${KLEINANZEIGEN_BOT_REF}" \
+    && git -C /opt/kleinanzeigen-bot-src checkout --detach FETCH_HEAD
 
 COPY scripts/patch_nodriver_connect_timeout.py /opt/patch_nodriver_connect_timeout.py
 
@@ -58,6 +57,7 @@ RUN apt-get update \
 
 COPY --from=kleinanzeigen-bot-build /opt/kleinanzeigen-bot-src/dist/kleinanzeigen-bot /usr/local/bin/kleinanzeigen
 RUN chmod +x /usr/local/bin/kleinanzeigen
+COPY --from=kleinanzeigen-bot-build /opt/kleinanzeigen-bot-src/src/kleinanzeigen_bot/resources/categories.yaml /app/resources/categories.yaml
 
 # Install Python dependencies
 COPY --chown=appuser pyproject.toml uv.lock ./
@@ -65,7 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 # Copy application source
-COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ./
+COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ad_store.py bot_runner.py ./
 COPY --chown=appuser skills/ ./skills/
 
 USER appuser

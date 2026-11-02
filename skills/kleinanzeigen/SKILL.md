@@ -1,7 +1,7 @@
 ---
 name: kleinanzeigen
 description: Kleinanzeigen.de-Inserate aus Fotos erstellen, veröffentlichen und verwalten.
-allowed-tools: publish_kleinanzeigen_ad, list_kleinanzeigen_ads, delete_kleinanzeigen_ad, deactivate_kleinanzeigen_ad
+allowed-tools: list_kleinanzeigen_ads, refresh_kleinanzeigen_status, search_kleinanzeigen_categories, delete_kleinanzeigen_ad, mark_kleinanzeigen_ad_sold, deactivate_kleinanzeigen_ad
 ---
 
 ## Kleinanzeigen-Inserate
@@ -14,7 +14,7 @@ Antworte immer als JSON-Objekt mit genau diesen Feldern:
 
 {
   "title": "kurz, max. 65 Zeichen, prägnant, mit Marke/Modell falls erkennbar",
-  "category": "passende Kleinanzeigen-Kategorie als Vorschlag, z.B. 'Elektronik > Audio & Hifi'",
+  "category": "exakter Kategoriename aus search_kleinanzeigen_categories, z.B. 'Elektronik > Audio & Hifi > Lautsprecher & Kopfhörer'",
   "condition": "Neu | Sehr gut | Gut | In Ordnung | Defekt",
   "description": "3-6 Sätze: was ist es, Zustand, Besonderheiten, Maße/Größe falls erkennbar. Sachlich, freundlich, ohne Übertreibung. Kein Kontaktdaten-Geblubber. Letzter Satz (in eigenem Abschnitt) ist immer 'Tierfreier Nichtraucherhaushalt. Versand bei Kostenübernahme möglich.'",
   "price_eur": 25,
@@ -33,26 +33,24 @@ formulieren"), wende den Wunsch an und gib das vollständige aktualisierte JSON 
 Ändere nur, was der Nutzer angefragt hat.
 
 ### Veröffentlichen
-Wenn der Nutzer das Inserat veröffentlichen möchte, rufe das Tool publish_kleinanzeigen_ad
-mit dem Pfad zur ad.yaml-Datei auf (nach dem Schreiben der Dateien).
+Veröffentlicht wird nur über den Button „Direkt schalten“ unter dem Entwurf. Weise den
+Nutzer darauf hin, wenn er veröffentlichen möchte.
 Antworte auf Inserate-Anfragen NUR mit dem JSON, keine Markdown-Codefences, kein Fließtext.
 
 ### Inserate verwalten
-Wenn der Nutzer seine Inserate sehen, löschen oder deaktivieren möchte:
+Diese Regel zum JSON gilt nicht für die Verwaltung bestehender Inserate. Dort antwortest du normal.
 
-1. **Auflisten**: Rufe `list_kleinanzeigen_ads()` auf. Gib die Inserate übersichtlich
-   aus: Titel, Preis, Status (aktiv/inaktiv), Kleinanzeigen-ID wenn vorhanden.
+1. **Auflisten**: Rufe `list_kleinanzeigen_ads()` auf. Nenne Titel, Preis, Status und den
+   Zeitpunkt des letzten Online-Abgleichs. Weise auf `missing`, `online_only` und bald
+   ablaufende Inserate hin. Ist `health.ok` falsch, sage das klar.
+2. **Aktualisieren**: Ist der Abgleich alt oder wünscht es der Nutzer, rufe
+   `refresh_kleinanzeigen_status()` auf. Das Ergebnis meldet der Bot selbst.
+3. **Verkauft**: `mark_kleinanzeigen_ad_sold(ad_key=...)`.
+4. **Löschen**: `delete_kleinanzeigen_ad(ad_key=...)`.
+5. **Deaktivieren** (nur lokal, bleibt online): `deactivate_kleinanzeigen_ad(ad_key=...)`.
 
-2. **Löschen** (vom Server und lokal): Rufe zuerst `list_kleinanzeigen_ads()` auf, um
-   den richtigen Index zu finden. Dann `delete_kleinanzeigen_ad(ad_index=N)`. Das
-   löscht das Inserat auf Kleinanzeigen.de (über Browser-Automatisierung) und
-   deaktiviert es lokal. Gibt es mehrere passende Treffer, frage nach.
+Bei Verkauft und Löschen fragt der Bot per Button nach. Sage erst danach, dass etwas
+ausgeführt wurde. Passen mehrere Inserate, frage nach, welches gemeint ist.
 
-3. **Deaktivieren** (nur lokal, Inserat bleibt live): Rufe `list_kleinanzeigen_ads()`
-   auf, dann `deactivate_kleinanzeigen_ad(ad_index=N)`. Das verhindert künftiges
-   Republizieren, ohne das Inserat von der Plattform zu entfernen.
-
-Beispiele für Nutzeranfragen:
-- "Zeige mir meine Kleinanzeigen" → list_kleinanzeigen_ads()
-- "Lösche die Anzeige für den Kinderwagen" → list + delete_kleinanzeigen_ad(passender Index)
-- "Deaktiviere das Fahrrad-Inserat" → list + deactivate_kleinanzeigen_ad(passender Index)
+Preisänderungen, Reservieren und Verlängern gibt es noch nicht. Sage das offen, wenn
+danach gefragt wird.

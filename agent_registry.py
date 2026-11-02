@@ -31,8 +31,10 @@ from tools import (
     get_lunch_plan,
     get_recipes,
     list_kleinanzeigen_ads,
-    publish_kleinanzeigen_ad,
+    mark_kleinanzeigen_ad_sold,
+    refresh_kleinanzeigen_status,
     save_lunch_plan,
+    search_kleinanzeigen_categories,
 )
 
 log = logging.getLogger("kleinanzeigen-agent.registry")
@@ -47,9 +49,11 @@ _TOOLS = [
     get_recipes,
     get_lunch_plan,
     save_lunch_plan,
-    publish_kleinanzeigen_ad,
     list_kleinanzeigen_ads,
+    refresh_kleinanzeigen_status,
+    search_kleinanzeigen_categories,
     delete_kleinanzeigen_ad,
+    mark_kleinanzeigen_ad_sold,
     deactivate_kleinanzeigen_ad,
 ]
 
