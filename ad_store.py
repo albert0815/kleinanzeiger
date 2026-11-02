@@ -7,8 +7,10 @@ import difflib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import shutil
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -250,6 +252,119 @@ def update_health(chat_id: int, ok: bool, kind: str | None, message: str | None)
     changed = previous["ok"] != ok or previous["kind"] != kind
     state["health"] = {"ok": ok, "kind": kind, "message": message}
     save_state(chat_id, state)
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Republishing: what is due, and refreshing local data from the online ad
+# ---------------------------------------------------------------------------
+
+# Everything else (id, dates, counters) stays local.
+_FIELDS_FROM_ONLINE = (
+    "type",
+    "title",
+    "description",
+    "category",
+    "special_attributes",
+    "price",
+    "price_type",
+    "shipping_type",
+    "shipping_costs",
+    "shipping_options",
+    "sell_directly",
+    "contact",
+)
+
+
+def _last_published(ad_file: Path) -> datetime.datetime:
+    data = yaml.safe_load(ad_file.read_text(encoding="utf-8")) or {}
+    dates = []
+    for value in (data.get("created_on"), data.get("updated_on")):
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.UTC)
+        dates.append(parsed)
+    return max(dates, default=datetime.datetime.min.replace(tzinfo=datetime.UTC))
+
+
+def select_for_republish(
+    chat_id: int,
+    online: list[OnlineAd],
+    interval_days: int,
+    now: datetime.datetime | None = None,
+) -> list[LocalAd]:
+    """Pick today's ads: online, active, not sold, due. Oldest first.
+
+    Spreads the account over the interval, so ads reappear staggered and the
+    monthly quota is not hit in one go.
+    """
+    now = now or datetime.datetime.now(datetime.UTC)
+    online_active = {ad.ad_id for ad in online if ad.state == "active"}
+    sold = load_state(chat_id)["sold"]
+    eligible = [
+        ad
+        for ad in list_local_ads(chat_id)
+        if ad.active and ad.ad_id in online_active and ad.key not in sold
+    ]
+    daily_limit = math.ceil(len(eligible) / interval_days)
+    published = {ad.key: _last_published(ad.path) for ad in eligible}
+    due = [
+        ad
+        for ad in eligible
+        if (now - published[ad.key]).days >= interval_days
+    ]
+    due.sort(key=lambda ad: published[ad.key])
+    return due[:daily_limit]
+
+
+def find_download(chat_id: int, ad_id: str) -> Path | None:
+    folder = base_dir() / str(chat_id) / "downloaded-ads"
+    return next(iter(sorted(folder.glob(f"ad_{ad_id}_*/ad_{ad_id}.yaml"))), None)
+
+
+def _local_images(ad_file: Path, data: dict) -> list[Path]:
+    found: set[Path] = set()
+    for pattern in data.get("images") or []:
+        found.update(p for p in ad_file.parent.glob(str(pattern)) if p.is_file())
+    return sorted(found)
+
+
+def merge_online_data(ad_file: Path, downloaded: Path) -> list[str]:
+    """Update a local ad with its online data. Returns the changed field names.
+
+    Local images are kept when their number matches: the downloaded ones are
+    recompressed, so re-uploading them each time would lower the quality.
+    """
+    local = yaml.safe_load(ad_file.read_text(encoding="utf-8")) or {}
+    remote = yaml.safe_load(downloaded.read_text(encoding="utf-8")) or {}
+    if not remote.get("title") or not remote.get("description"):
+        raise ValueError(f"Unvollständige Online-Daten: {downloaded}")
+
+    changed = [f for f in _FIELDS_FROM_ONLINE if local.get(f) != remote.get(f)]
+    for field_name in changed:
+        local[field_name] = remote.get(field_name)
+    # The online description already includes any prefix or suffix.
+    local["description_prefix"] = ""
+    local["description_suffix"] = ""
+
+    images = _local_images(ad_file, local)
+    remote_images = [downloaded.parent / str(name) for name in remote.get("images") or []]
+    if remote_images and len(images) != len(remote_images):
+        for image in images:
+            image.unlink()
+        for image in remote_images:
+            shutil.copy2(image, ad_file.parent / image.name)
+        local["images"] = [image.name for image in remote_images]
+        changed.append("images")
+
+    temporary = ad_file.with_suffix(".tmp")
+    temporary.write_text(
+        yaml.safe_dump(local, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    temporary.replace(ad_file)
     return changed
 
 

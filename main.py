@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -88,11 +90,12 @@ def _user_work_dir(chat_id: int) -> Path:
     return ad_store.base_dir() / str(chat_id) / "ads"
 
 
-# Off by default: the local ads have drifted from what is actually online, so an
-# automatic `publish --ads due` could put sold or removed items back online.
+# Republishing replaces the online ad and costs watchers, so it is opt-in.
 KLEINANZEIGEN_AUTO_REPUBLISH = (
     os.environ.get("KLEINANZEIGEN_AUTO_REPUBLISH", "false").lower() == "true"
 )
+
+KLEINANZEIGEN_REPUBLISH_DAYS = int(os.environ.get("KLEINANZEIGEN_REPUBLISH_DAYS", "14"))
 
 KLEINANZEIGEN_REPUBLISH_TIME = datetime.time(
     int(os.environ.get("KLEINANZEIGEN_REPUBLISH_HOUR", "9")),
@@ -582,26 +585,15 @@ async def send_lunch_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def republish_kleinanzeigen(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback: re-run kleinanzeigen-bot for every allowed user daily."""
-    log.info("Daily republish run for %d user(s)", len(ALLOWED_USER_IDS))
+    """JobQueue callback: queue the daily republish run for every account."""
     for user_id in ALLOWED_USER_IDS:
-        try:
-            result = await bot_runner.publish_due(user_id)
-        except BotFailure as e:
-            log.error("[chat=%d] republish failed: %s", user_id, e)
-            continue
-        if result.returncode == 0:
-            log.info("[chat=%d] republish succeeded", user_id)
-            continue
-        log.error(
-            "[chat=%d] republish failed (rc=%d):\n%s",
-            user_id,
-            result.returncode,
-            result.output,
-        )
-        await context.bot.send_message(
-            user_id,
-            f"⚠️ Tägliche Neu-Veröffentlichung fehlgeschlagen (rc={result.returncode})",
+        # No automatic retry: a repeated run could put an ad online twice.
+        QUEUE_MANAGER.enqueue(
+            job_id=str(uuid.uuid4()),
+            chat_id=user_id,
+            job_type="republish_ads",
+            data={"chat_id": user_id},
+            max_retries=1,
         )
 
 
@@ -1074,6 +1066,65 @@ async def handle_delete_job(job_data: dict) -> tuple[bool, str]:
     return True, f"✅ Nicht mehr online und lokal deaktiviert: {ad.title}"
 
 
+async def handle_republish_job(job_data: dict) -> tuple[bool, str]:
+    """Republish today's due ads, using their current online data."""
+    chat_id = job_data["chat_id"]
+    try:
+        online = await bot_runner.list_online(chat_id)
+    except BotFailure as e:
+        ad_store.update_health(chat_id, False, e.kind, str(e))
+        return False, f"Neu schalten ausgefallen: {_describe_failure(e)}"
+
+    selected = ad_store.select_for_republish(
+        chat_id, online, KLEINANZEIGEN_REPUBLISH_DAYS
+    )
+    if not selected:
+        await _store_online_snapshot(chat_id, online)
+        return True, ""
+
+    lines: list[str] = []
+    ready: list[ad_store.LocalAd] = []
+    try:
+        await bot_runner.download_ids(chat_id, [ad.ad_id for ad in selected])
+        for ad in selected:
+            downloaded = ad_store.find_download(chat_id, ad.ad_id)
+            if not downloaded:
+                lines.append(f"⚠️ Übersprungen, Online-Daten fehlen: {ad.title}")
+                continue
+            try:
+                changed = ad_store.merge_online_data(ad.path, downloaded)
+            except (OSError, ValueError, yaml.YAMLError) as e:
+                log.error("[chat=%d] merge failed for %s: %s", chat_id, ad.path, e)
+                lines.append(f"⚠️ Übersprungen, Daten nicht lesbar: {ad.title}")
+                continue
+            finally:
+                shutil.rmtree(downloaded.parent, ignore_errors=True)
+            log.info("[chat=%d] Refreshed %s: %s", chat_id, ad.ad_id, changed)
+            ready.append(ad)
+
+        if ready:
+            result = await bot_runner.publish_ids(chat_id, [ad.ad_id for ad in ready])
+            log.info("[chat=%d] republish output:\n%s", chat_id, result.output)
+        online = await bot_runner.list_online(chat_id)
+    except BotFailure as e:
+        return False, f"Neu schalten unterbrochen: {_describe_failure(e)}"
+
+    online_ids = {o.ad_id for o in online}
+    for ad in ready:
+        current = ad_store.load_ad_file(chat_id, ad.path)
+        new_id = current.ad_id if current else None
+        if not new_id or new_id == ad.ad_id:
+            lines.append(f"❌ Nicht neu geschaltet: {ad.title}")
+        elif new_id not in online_ids:
+            lines.append(f"⚠️ Neue Anzeige online nicht gefunden: {ad.title}")
+        elif ad.ad_id in online_ids:
+            lines.append(f"⚠️ Jetzt doppelt online, alte Anzeige prüfen: {ad.title}")
+        else:
+            lines.append(f"🔄 Neu geschaltet: {ad.title}")
+    await _store_online_snapshot(chat_id, online)
+    return True, "\n".join(lines)
+
+
 async def handle_sync_job(job_data: dict) -> tuple[bool, str]:
     """Refresh the online snapshot. sync_account reports results itself."""
     await sync_account(job_data["chat_id"], announce=bool(job_data.get("announce")))
@@ -1265,6 +1316,7 @@ def main() -> None:
         "publish_ad": handle_publish_job,
         "delete_ad": handle_delete_job,
         "sync_ads": handle_sync_job,
+        "republish_ads": handle_republish_job,
     }
 
     app = Application.builder().token(token).build()

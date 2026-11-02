@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import ad_store
 import bot_runner
 from ad_store import OnlineAd
@@ -143,6 +145,96 @@ class SyncTest(TempBase):
         ad = ad_store.load_ad_file(CHAT, path)
         self.assertFalse(ad.active)
         self.assertEqual(ad.ad_id, "1")
+
+
+class RepublishSelectionTest(TempBase):
+    NOW = datetime.datetime(2026, 11, 20, tzinfo=datetime.UTC)
+
+    def ad(self, name, ad_id, updated, **kwargs):
+        path = write_ad(self.base, name, ad_id=ad_id, title=name, **kwargs)
+        with path.open("a") as f:
+            f.write(f"updated_on: '{updated}T00:00:00+00:00'\n")
+        return path
+
+    def select(self, online, days=14):
+        return [a.title for a in ad_store.select_for_republish(CHAT, online, days, self.NOW)]
+
+    def test_only_online_active_due_and_not_sold(self):
+        self.ad("faellig", 1, "2026-11-01")
+        self.ad("frisch", 2, "2026-11-15")
+        self.ad("fehlt", 3, "2026-01-01")
+        self.ad("aus", 4, "2026-01-01", active=False)
+        self.ad("reserviert", 5, "2026-01-01")
+        sold = self.ad("verkauft", 6, "2026-01-01")
+        write_ad(self.base, "entwurf", title="entwurf")
+        ad_store.record_sold(CHAT, ad_store.load_ad_file(CHAT, sold))
+        online = [
+            OnlineAd("1", "", "active", "-"),
+            OnlineAd("2", "", "active", "-"),
+            OnlineAd("4", "", "active", "-"),
+            OnlineAd("5", "", "reserved", "-"),
+            OnlineAd("6", "", "active", "-"),
+            OnlineAd("99", "", "active", "-"),
+        ]
+        self.assertEqual(self.select(online), ["faellig"])
+
+    def test_spread_over_interval_oldest_first(self):
+        for i in range(29):
+            self.ad(f"ad{i:02}", i + 1, f"2026-01-{i + 1:02}" if i < 28 else "2025-12-01")
+        online = [OnlineAd(str(i + 1), "", "active", "-") for i in range(29)]
+        self.assertEqual(self.select(online), ["ad28", "ad00", "ad01"])
+
+    def test_empty_when_nothing_online(self):
+        self.ad("a", 1, "2026-01-01")
+        self.assertEqual(self.select([]), [])
+
+
+class MergeOnlineDataTest(TempBase):
+    def setUp(self):
+        super().setUp()
+        self.local = write_ad(self.base, "lokal", ad_id=1, title="Jacke")
+        with self.local.open("a") as f:
+            f.write("description: alt\nimages:\n  - '*.jpg'\nrepost_count: 3\n")
+        (self.local.parent / "a.jpg").write_bytes(b"orig")
+        folder = self.base / str(CHAT) / "downloaded-ads" / "ad_1_Jacke"
+        folder.mkdir(parents=True)
+        self.remote = folder / "ad_1.yaml"
+        self.folder = folder
+
+    def write_remote(self, images):
+        for name in images:
+            (self.folder / name).write_bytes(b"neu")
+        self.remote.write_text(
+            yaml.safe_dump(
+                {"title": "Jacke", "description": "neu", "price": 30, "id": 999,
+                 "repost_count": 0, "images": images}
+            )
+        )
+
+    def test_online_data_wins_and_local_bookkeeping_stays(self):
+        self.write_remote(["x1.jpg"])
+        self.assertEqual(ad_store.find_download(CHAT, "1"), self.remote)
+        changed = ad_store.merge_online_data(self.local, self.remote)
+        data = yaml.safe_load(self.local.read_text())
+        self.assertIn("price", changed)
+        self.assertEqual((data["price"], data["description"]), (30, "neu"))
+        self.assertEqual((data["id"], data["repost_count"]), (1, 3))
+        self.assertEqual(data["description_suffix"], "")
+        self.assertEqual((self.local.parent / "a.jpg").read_bytes(), b"orig")
+
+    def test_images_replaced_when_number_differs(self):
+        self.write_remote(["x1.jpg", "x2.jpg"])
+        ad_store.merge_online_data(self.local, self.remote)
+        data = yaml.safe_load(self.local.read_text())
+        self.assertEqual(data["images"], ["x1.jpg", "x2.jpg"])
+        self.assertFalse((self.local.parent / "a.jpg").exists())
+
+    def test_incomplete_download_changes_nothing(self):
+        before = self.local.read_text()
+        self.remote.write_text(yaml.safe_dump({"title": "Jacke"}))
+        with self.assertRaises(ValueError):
+            ad_store.merge_online_data(self.local, self.remote)
+        self.assertEqual(self.local.read_text(), before)
 
 
 class CategoryTest(TempBase):
@@ -325,6 +417,59 @@ class MainFlowTest(TempBase):
             )
         self.assertFalse(ok)
         self.assertTrue(ad_store.load_ad_file(CHAT, path).active)
+
+    def republish_setup(self):
+        path = write_ad(self.base, "a", ad_id=1, title="A")
+        folder = self.base / str(CHAT) / "downloaded-ads" / "ad_1_A"
+        folder.mkdir(parents=True)
+        (folder / "ad_1.yaml").write_text(
+            yaml.safe_dump({"title": "A", "description": "online", "price": 30})
+        )
+        return path, folder
+
+    def run_republish(self, *lists, publish=None):
+        with (
+            mock.patch.object(bot_runner, "list_online", mock.AsyncMock(side_effect=list(lists))),
+            mock.patch.object(bot_runner, "download_ids", mock.AsyncMock()),
+            mock.patch.object(bot_runner, "publish_ids", publish or mock.AsyncMock(return_value=bot_runner.BotResult(0, ""))),
+        ):
+            return asyncio.run(self.main.handle_republish_job({"chat_id": CHAT}))
+
+    def test_republish_refreshes_then_verifies(self):
+        path, folder = self.republish_setup()
+
+        async def publish(chat_id, ids):
+            self.assertEqual(ids, ["1"])
+            self.assertEqual(yaml.safe_load(path.read_text())["price"], 30)
+            data = yaml.safe_load(path.read_text())
+            data["id"] = 2
+            path.write_text(yaml.safe_dump(data))
+            return bot_runner.BotResult(0, "")
+
+        ok, message = self.run_republish(
+            [OnlineAd("1", "A", "active", "-")], [OnlineAd("2", "A", "active", "-")], publish=publish
+        )
+        self.assertTrue(ok)
+        self.assertIn("Neu geschaltet: A", message)
+        self.assertFalse(folder.exists())
+
+    def test_republish_reports_duplicate_and_unchanged(self):
+        path, _ = self.republish_setup()
+        ok, message = self.run_republish(
+            [OnlineAd("1", "A", "active", "-")], [OnlineAd("1", "A", "active", "-")]
+        )
+        self.assertIn("Nicht neu geschaltet", message)
+
+    def test_republish_stops_if_online_list_fails(self):
+        self.republish_setup()
+        publish = mock.AsyncMock()
+        with (
+            mock.patch.object(bot_runner, "list_online", mock.AsyncMock(side_effect=bot_runner.BotFailure("login", "x"))),
+            mock.patch.object(bot_runner, "publish_ids", publish),
+        ):
+            ok, _ = asyncio.run(self.main.handle_republish_job({"chat_id": CHAT}))
+        self.assertFalse(ok)
+        publish.assert_not_called()
 
     def test_failed_sync_is_reported_once_and_recovery_once(self):
         failure = bot_runner.BotFailure("login", "x")
