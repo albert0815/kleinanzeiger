@@ -16,7 +16,6 @@ from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,6 +33,7 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
+import mahlino
 from agent_registry import clear_agent, get_agent
 from background_worker import BackgroundWorker
 from queue_manager import QueueManager
@@ -97,10 +97,6 @@ QUEUE_DIR = Path(
         "KLEINANZEIGEN_QUEUE_DIR",
         "/tmp/kleinanzeigen-queue",
     )
-)
-LUNCH_PLAN_BASE_URL = os.environ.get(
-    "LUNCH_PLAN_URL",
-    "http://ubuntu.fritz.box:880/resources/plan",
 )
 LUNCH_PLAN_TZ = ZoneInfo("Europe/Berlin")
 
@@ -574,19 +570,6 @@ async def _call_agent_streaming(
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_lunch_plan_range(
-    start: datetime.date, end: datetime.date
-) -> list[dict]:
-    url = (
-        f"{LUNCH_PLAN_BASE_URL}?startDate={start.isoformat()}&endDate={end.isoformat()}"
-    )
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url, headers={"Accept": "application/json"})
-        resp.raise_for_status()
-        data = resp.json()
-    return data if isinstance(data, list) else [data]
-
-
 def _has_meal(plan_entries: list[dict], date: datetime.date) -> bool:
     date_str = date.isoformat()
     entry = next((e for e in plan_entries if e.get("date") == date_str), None)
@@ -646,7 +629,7 @@ async def send_lunch_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Sending lunch plan for %s to %d user(s)", today, len(ALLOWED_USER_IDS))
 
     try:
-        plan_range = await _fetch_lunch_plan_range(today, tomorrow)
+        plan_range = await mahlino.fetch_plan(today, tomorrow)
     except Exception as e:
         log.error("Failed to fetch lunch plan: %s", e)
         return
@@ -780,7 +763,7 @@ async def cmd_lunch(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     today = datetime.datetime.now(LUNCH_PLAN_TZ).date()
     await update.message.reply_text("🔍 Hole Mittagessen…")
     try:
-        plan = await _fetch_lunch_plan_range(today, today)
+        plan = await mahlino.fetch_plan(today, today)
     except Exception as e:
         log.error("cmd_lunch: fetch failed: %s", e)
         await update.message.reply_text(f"Fehler beim Abrufen: {e}")
