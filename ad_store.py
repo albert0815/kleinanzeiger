@@ -212,6 +212,35 @@ def overview(chat_id: int, today: datetime.date | None = None) -> dict:
     }
 
 
+def online_view(chat_id: int, today: datetime.date | None = None) -> dict:
+    """What is actually on Kleinanzeigen, plus the actions possible for each ad.
+
+    Prices are left out on purpose: `list` does not report them and the local
+    value can be outdated.
+    """
+    today = today or datetime.date.today()
+    state = load_state(chat_id)
+    local_by_id = {ad.ad_id: ad for ad in list_local_ads(chat_id) if ad.ad_id}
+    entries = []
+    for online in state["online"]:
+        local = local_by_id.get(online["ad_id"])
+        expiry = _parse_expiry(online["expires"])
+        entries.append(
+            {
+                "key": local.key if local else None,
+                "ad_id": online["ad_id"],
+                "title": online["title"],
+                "state": online["state"],
+                "expires": online["expires"],
+                "expiring_soon": bool(
+                    expiry and (expiry - today).days <= EXPIRY_WARNING_DAYS
+                ),
+                "auto_republish": bool(local and local.active),
+            }
+        )
+    return {"synced_at": state["synced_at"], "health": state["health"], "ads": entries}
+
+
 def apply_sync(
     chat_id: int, online: list[OnlineAd], now: datetime.datetime | None = None
 ) -> dict:
