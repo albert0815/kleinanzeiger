@@ -86,6 +86,12 @@ def _clear_stale_browser_lock(cfg_path: Path) -> None:
             log.warning("Could not remove stale browser lock %s: %s", lock_file, e)
 
 
+# Off by default: the local ads have drifted from what is actually online, so an
+# automatic `publish --ads due` could put sold or removed items back online.
+KLEINANZEIGEN_AUTO_REPUBLISH = (
+    os.environ.get("KLEINANZEIGEN_AUTO_REPUBLISH", "false").lower() == "true"
+)
+
 KLEINANZEIGEN_REPUBLISH_TIME = datetime.time(
     int(os.environ.get("KLEINANZEIGEN_REPUBLISH_HOUR", "9")),
     int(os.environ.get("KLEINANZEIGEN_REPUBLISH_MINUTE", "0")),
@@ -1271,7 +1277,9 @@ def main() -> None:
             name="lunch_plan_daily",
         )
         log.info("Lunch plan job scheduled at 08:30 Europe/Berlin")
-        if KLEINANZEIGEN_BOT_CMD:
+        if not KLEINANZEIGEN_AUTO_REPUBLISH:
+            log.info("Kleinanzeigen auto-republish is disabled")
+        elif KLEINANZEIGEN_BOT_CMD:
             app.job_queue.run_daily(
                 republish_kleinanzeigen,
                 time=KLEINANZEIGEN_REPUBLISH_TIME,
