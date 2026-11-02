@@ -341,6 +341,32 @@ async def _store_online_snapshot(
     await _send_sync_report(chat_id, ad_store.apply_sync(chat_id, online), announce)
 
 
+async def _import_online_only(chat_id: int, online: list[ad_store.OnlineAd]) -> None:
+    """Take over ads created outside the agent, e.g. in the app."""
+    local_ids = {ad.ad_id for ad in ad_store.list_local_ads(chat_id)}
+    new_ids = [ad.ad_id for ad in online if ad.ad_id not in local_ids]
+    if not new_ids:
+        return
+    try:
+        await bot_runner.download_ids(chat_id, new_ids)
+    except BotFailure as e:
+        log.error("[chat=%d] importing online ads failed: %s", chat_id, e)
+        return
+    imported = []
+    for ad_id in new_ids:
+        downloaded = ad_store.find_download(chat_id, ad_id)
+        try:
+            ad = ad_store.import_download(chat_id, downloaded) if downloaded else None
+        except OSError as e:
+            log.error("[chat=%d] importing %s failed: %s", chat_id, ad_id, e)
+            continue
+        if ad:
+            imported.append(ad.title)
+    if imported:
+        text = "📥 Von Kleinanzeigen übernommen:\n" + "\n".join(f"• {t}" for t in imported)
+        await BOT.send_message(chat_id, text[:TELEGRAM_MESSAGE_LIMIT])
+
+
 async def sync_account(chat_id: int, *, announce: bool = False) -> bool:
     """Refresh the online snapshot. Failures are reported once per failure type."""
     try:
@@ -354,6 +380,7 @@ async def sync_account(chat_id: int, *, announce: bool = False) -> bool:
                 chat_id, f"⚠️ Online-Abgleich fehlgeschlagen: {_describe_failure(e)}"
             )
         return False
+    await _import_online_only(chat_id, online)
     await _store_online_snapshot(chat_id, online, announce=announce)
     return True
 
@@ -1075,6 +1102,7 @@ async def handle_republish_job(job_data: dict) -> tuple[bool, str]:
         ad_store.update_health(chat_id, False, e.kind, str(e))
         return False, f"Neu schalten ausgefallen: {_describe_failure(e)}"
 
+    await _import_online_only(chat_id, online)
     selected = ad_store.select_for_republish(
         chat_id, online, KLEINANZEIGEN_REPUBLISH_DAYS
     )

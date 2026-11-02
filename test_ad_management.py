@@ -471,6 +471,45 @@ class MainFlowTest(TempBase):
         self.assertFalse(ok)
         publish.assert_not_called()
 
+    def fake_download(self, ad_id, title):
+        async def download(chat_id, ids):
+            self.assertEqual(ids, [ad_id])
+            folder = self.base / str(CHAT) / "downloaded-ads" / f"ad_{ad_id}_{title}"
+            folder.mkdir(parents=True)
+            (folder / f"ad_{ad_id}.yaml").write_text(
+                yaml.safe_dump({"active": True, "id": int(ad_id), "title": title, "description": "d", "price": 1})
+            )
+            (folder / f"ad_{ad_id}__img1.jpg").write_bytes(b"x")
+        return download
+
+    def test_sync_imports_ad_created_in_app(self):
+        online = [OnlineAd("7", "App", "active", "-")]
+        with (
+            mock.patch.object(bot_runner, "list_online", mock.AsyncMock(return_value=online)),
+            mock.patch.object(bot_runner, "download_ids", self.fake_download("7", "App")),
+        ):
+            self.assertTrue(asyncio.run(self.main.sync_account(CHAT)))
+        view = ad_store.overview(CHAT)
+        self.assertEqual([(a["title"], a["status"]) for a in view["ads"]], [("App", "online")])
+        self.assertEqual(view["online_only"], [])
+        self.assertTrue((self.base / str(CHAT) / "ads" / "ad_7_App" / "ad_7__img1.jpg").exists())
+        downloads = mock.AsyncMock()
+        with (
+            mock.patch.object(bot_runner, "list_online", mock.AsyncMock(return_value=online)),
+            mock.patch.object(bot_runner, "download_ids", downloads),
+        ):
+            asyncio.run(self.main.sync_account(CHAT))
+        downloads.assert_not_called()
+
+    def test_failed_import_keeps_ad_listed_and_sync_alive(self):
+        online = [OnlineAd("7", "App", "active", "-")]
+        with (
+            mock.patch.object(bot_runner, "list_online", mock.AsyncMock(return_value=online)),
+            mock.patch.object(bot_runner, "download_ids", mock.AsyncMock(side_effect=bot_runner.BotFailure("timeout", "x"))),
+        ):
+            self.assertTrue(asyncio.run(self.main.sync_account(CHAT)))
+        self.assertEqual(len(ad_store.overview(CHAT)["online_only"]), 1)
+
     def test_failed_sync_is_reported_once_and_recovery_once(self):
         failure = bot_runner.BotFailure("login", "x")
         with mock.patch.object(bot_runner, "list_online", mock.AsyncMock(side_effect=failure)):

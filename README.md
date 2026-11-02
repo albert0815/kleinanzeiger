@@ -121,6 +121,8 @@ Example: `/retry_a1b2c3d4` (use the 8-character job ID from `/backout`)
 The bot keeps a snapshot of what is online in `<base>/<chat_id>/agent-state.json`.
 It is refreshed by `/inserate` when older than 15 minutes, after every change made
 through the bot, on request in the chat, and twice a day at slightly varying times.
+Ads created outside the agent, for example in the app, are downloaded into `ads/` and
+managed like all others. To keep one from being republished, deactivate it locally.
 You are told once about new differences and once when access fails or recovers.
 
 ## Republishing

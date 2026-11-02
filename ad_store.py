@@ -325,6 +325,17 @@ def find_download(chat_id: int, ad_id: str) -> Path | None:
     return next(iter(sorted(folder.glob(f"ad_{ad_id}_*/ad_{ad_id}.yaml"))), None)
 
 
+def import_download(chat_id: int, downloaded: Path) -> LocalAd | None:
+    """Make a downloaded ad a regular local ad. Existing folders stay untouched."""
+    target = _ads_dir(chat_id) / downloaded.parent.name
+    if target.exists():
+        log.warning("[chat=%d] Not importing, %s already exists", chat_id, target)
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(downloaded.parent), str(target))
+    return _load_ad(chat_id, target / downloaded.name)
+
+
 def _local_images(ad_file: Path, data: dict) -> list[Path]:
     found: set[Path] = set()
     for pattern in data.get("images") or []:
