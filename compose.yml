@@ -8,6 +8,8 @@ services:
         - type=local,dest=/opt/buildkit-cache/kleinanzeigen-agent,mode=max
     container_name: kleinanzeigen-agent
     restart: unless-stopped
+    # Reaps the Chromium processes the bot leaves behind as zombies.
+    init: true
     env_file:
       - .env
     environment:

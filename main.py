@@ -7,8 +7,8 @@ import datetime
 import json
 import logging
 import os
+import random
 import re
-import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -33,11 +33,14 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
+import ad_store
+import bot_runner
 import mahlino
 from agent_registry import clear_agent, get_agent
 from background_worker import BackgroundWorker
 from queue_manager import QueueManager
-from tools import set_agent_chat_id, set_queue_enqueue_fn
+from bot_runner import BotFailure
+from tools import set_agent_chat_id, set_confirmation_fn, set_queue_enqueue_fn
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -52,38 +55,37 @@ STREAM_EDIT_MIN_CHARS = 80
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 KLEINANZEIGEN_BOT_CMD = os.environ.get("KLEINANZEIGEN_BOT_CMD", "")
-KLEINANZEIGEN_BASE_DIR = Path(
-    os.environ.get(
-        "KLEINANZEIGEN_BASE_DIR",
-        "/docker-volumes/kleinanzeiger/kleinanzeigen-config",
-    )
-)
-
-
-def _user_config_path(chat_id: int) -> Path:
-    """Return the persistent config.yaml path for a given Telegram chat user."""
-    return KLEINANZEIGEN_BASE_DIR / str(chat_id) / "config.yaml"
+SYNC_MAX_AGE = datetime.timedelta(minutes=15)
+# Scheduled online checks (Europe/Berlin), each delayed by a random amount.
+SYNC_TIMES = (datetime.time(7, 30), datetime.time(18, 30))
+SYNC_MAX_JITTER_SECONDS = 45 * 60
+CONDITION_VALUES = {
+    "neu": "new",
+    "sehr gut": "like_new",
+    "gut": "ok",
+    "in ordnung": "alright",
+    "defekt": "defect",
+}
+FAILURE_HINTS = {
+    "login": "Der Login bei Kleinanzeigen hat nicht geklappt. Eventuell ist eine "
+    "manuelle Anmeldung mit SMS-Code oder Captcha nötig.",
+    "browser": "Der Browser ließ sich nicht starten.",
+    "timeout": "Kleinanzeigen hat nicht rechtzeitig geantwortet.",
+}
+STATUS_LABELS = {
+    "online": "🟢 online",
+    "reserved": "🟡 reserviert",
+    "missing": "⚠️ fehlt online",
+    "draft": "📝 nie geschaltet",
+    "inactive": "🔴 inaktiv",
+    "sold": "💰 verkauft",
+    "unknown": "❔ noch nicht geprüft",
+}
 
 
 def _user_work_dir(chat_id: int) -> Path:
     """Return the ads working directory for a given Telegram chat user."""
-    return KLEINANZEIGEN_BASE_DIR / str(chat_id) / "ads"
-
-
-def _clear_stale_browser_lock(cfg_path: Path) -> None:
-    """Remove Chromium SingletonLock/Cookie/Socket files left behind by a
-    previous container instance (its hostname no longer matches ours, so
-    Chromium refuses to reuse the profile and publishing fails).
-    """
-    profile_dir = cfg_path.parent / ".temp" / "browser-profile"
-    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-        lock_file = profile_dir / name
-        try:
-            lock_file.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log.warning("Could not remove stale browser lock %s: %s", lock_file, e)
+    return ad_store.base_dir() / str(chat_id) / "ads"
 
 
 # Off by default: the local ads have drifted from what is actually online, so an
@@ -101,7 +103,7 @@ KLEINANZEIGEN_REPUBLISH_TIME = datetime.time(
 QUEUE_DIR = Path(
     os.environ.get(
         "KLEINANZEIGEN_QUEUE_DIR",
-        "/tmp/kleinanzeigen-queue",
+        str(ad_store.base_dir() / ".queue"),
     )
 )
 LUNCH_PLAN_TZ = ZoneInfo("Europe/Berlin")
@@ -141,6 +143,8 @@ DRAFTS: dict[int, Draft] = {}
 PENDING_ALBUMS: dict[tuple[int, str], dict] = {}
 CHAT_PHOTO_POOL: dict[int, list[bytes]] = {}
 ACTIVE_GENERATION_TASKS: dict[int, asyncio.Task] = {}
+
+BOT = None  # set in main(); job handlers have no callback context
 
 # chat_ids that have a pending lunch plan suggestion awaiting confirmation
 PENDING_LUNCH_PLAN: set[int] = set()
@@ -242,6 +246,11 @@ def _yaml_escape(s: str) -> str:
 
 def write_ad_files(d: Draft, chat_id: int) -> Path:
     """Persist photos + ad.yaml into a fresh working directory. Returns ad.yaml path."""
+    category = ad_store.resolve_category(d.category)
+    if not category:
+        raise ValueError(
+            f"Die Kategorie «{d.category}» kenne ich nicht. Nenne mir bitte eine passende."
+        )
     work_dir = _user_work_dir(chat_id)
     work_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -254,12 +263,15 @@ def write_ad_files(d: Draft, chat_id: int) -> Path:
 
     title = d.title.replace("\n", " ").strip()
     desc = d.description.strip()
+    condition = CONDITION_VALUES.get(d.condition.strip().lower())
+    attributes = f"special_attributes:\n  condition_s: {condition}\n" if condition else ""
     yaml_text = (
         "active: true\n"
         f"title: {_yaml_escape(title)}\n"
         f"description: {_yaml_escape(desc)}\n"
-        f"category: {_yaml_escape(d.category)}\n"
+        f"category: {_yaml_escape(category)}\n"
         f"price: {int(d.price_eur)}\n"
+        f"{attributes}"
         'images:\n  - "*.jpg"\n'
     )
     ad_file = ad_dir / "ad_new.yaml"
@@ -267,167 +279,80 @@ def write_ad_files(d: Draft, chat_id: int) -> Path:
     return ad_file
 
 
-# nodriver only polls Chrome's DevTools port for ~2-3s before giving up, so a
-# slow cold start can fail even though the browser itself works fine; retrying
-# the whole invocation a few times works around this known upstream race.
-_TRANSIENT_BROWSER_ERROR_MARKER = (
-    "Failed to start browser. This error often occurs when"
-)
+def _describe_failure(error: BotFailure) -> str:
+    hint = FAILURE_HINTS.get(error.kind)
+    return f"{hint} ({error})" if hint else str(error)
 
 
-async def _run_bot_subprocess(cmd: list[str], cwd: Path) -> tuple[int, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+def _strip_condition(ad_file: Path) -> None:
+    """Remove the condition attribute, which some categories do not offer."""
+    text = ad_file.read_text(encoding="utf-8")
+    ad_file.write_text(
+        re.sub(r"(?m)^special_attributes:\n\s+condition_s:.*\n", "", text),
+        encoding="utf-8",
     )
-    stdout_b, _ = await proc.communicate()
-    return proc.returncode or 0, stdout_b.decode("utf-8", errors="replace")
 
 
-async def _run_bot_with_retry(
-    chat_id: int, cmd: list[str], cfg_path: Path, *, attempts: int = 3
-) -> tuple[int, str]:
-    """Run the kleinanzeigen-bot subprocess, retrying on the transient browser
-    DevTools-connect race described above.
-    """
-    rc, output = 0, ""
-    for attempt in range(1, attempts + 1):
-        rc, output = await _run_bot_subprocess(cmd, cfg_path.parent)
-        if rc == 0 or _TRANSIENT_BROWSER_ERROR_MARKER not in output:
-            return rc, output
-        log.warning(
-            "[chat=%d] Transient browser startup failure, retrying (%d/%d)",
+async def _send_sync_report(chat_id: int, report: dict, announce: bool) -> None:
+    if report["first_sync"]:
+        await BOT.send_message(
             chat_id,
-            attempt,
-            attempts,
+            "🔄 Erster Online-Abgleich fertig: "
+            f"{len(report['missing'])} lokal aktive Inserate fehlen online, "
+            f"{len(report['online_only'])} sind nur online vorhanden. "
+            "Details unter /inserate.",
         )
-        _clear_stale_browser_lock(cfg_path)
-        await asyncio.sleep(2)
-    return rc, output
-
-
-async def run_kleinanzeigen_bot(
-    chat_id: int, *, ads_filter: str = "new"
-) -> tuple[int, str]:
-    """Run kleinanzeigen-bot publish for a specific user. Returns (rc, combined_output).
-
-    Each user needs their own config.yaml at:
-        KLEINANZEIGEN_BASE_DIR/<chat_id>/config.yaml
-
-    The file must be created once manually with login credentials, browser
-    arguments, and an ad_files glob covering the user's ads directory, e.g.:
-
-        login:
-          username: "user@example.com"
-          password: "secret"
-        ad_files:
-          - "ads/*/*.yaml"
-        browser:
-          arguments:
-            - --no-sandbox
-            - --disable-dev-shm-usage
-            - --disable-gpu
-            - --ozone-platform=headless
-    """
-    cfg_path = _user_config_path(chat_id)
-    if not cfg_path.exists():
-        raise RuntimeError(
-            f"Konfigurationsdatei nicht gefunden: {cfg_path}\n"
-            f"Bitte config.yaml für Nutzer {chat_id} mit Login-Daten, "
-            "ad_files-Glob und Browser-Argumenten einmalig manuell anlegen."
+        return
+    for ad in report["missing"]:
+        await BOT.send_message(
+            chat_id,
+            f"⚠️ Nicht mehr online: {ad['title']}\nWurde es verkauft?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "💰 Verkauft", callback_data=f"sold:{ad['key']}"
+                        ),
+                        InlineKeyboardButton(
+                            "⏸ Deaktivieren", callback_data=f"deact:{ad['key']}"
+                        ),
+                    ]
+                ]
+            ),
         )
-    _clear_stale_browser_lock(cfg_path)
-    cmd = shlex.split(KLEINANZEIGEN_BOT_CMD) + [
-        "--workspace-mode=portable",
-        "--config",
-        str(cfg_path),
-        "publish",
-        "--ads",
-        ads_filter,
-    ]
-    log.info("[chat=%d] Running: %s", chat_id, " ".join(cmd))
-    return await _run_bot_with_retry(chat_id, cmd, cfg_path)
+    for ad in report["online_only"]:
+        await BOT.send_message(chat_id, f"🆕 Nur online vorhanden: {ad['title']}")
+    for ad in report["expiring"]:
+        await BOT.send_message(
+            chat_id, f"⏳ Läuft am {ad['expires']} ab: {ad['title']}"
+        )
+    if announce and not any(report[k] for k in ("missing", "online_only", "expiring")):
+        await BOT.send_message(chat_id, "✅ Online-Abgleich: keine neuen Abweichungen.")
 
 
-async def run_kleinanzeigen_bot_delete(chat_id: int, ad_file: Path) -> tuple[int, str]:
-    """Run kleinanzeigen-bot delete for a single ad file, then deactivate it locally.
-
-    On success (rc=0) sets active: false in the ad.yaml so the daily republish
-    job will never pick it up again.
-    """
-    cfg_path = _user_config_path(chat_id)
-    if not cfg_path.exists():
-        raise RuntimeError(f"Konfigurationsdatei nicht gefunden: {cfg_path}")
-    _clear_stale_browser_lock(cfg_path)
-    # Build a temporary ad_files glob pointing only at this one file so the
-    # delete command won't touch any other ads.
-    rel = ad_file.relative_to(cfg_path.parent)
-    cmd = shlex.split(KLEINANZEIGEN_BOT_CMD) + [
-        "--workspace-mode=portable",
-        "--config",
-        str(cfg_path),
-        "delete",
-        "--ads",
-        str(rel),
-    ]
-    log.info("[chat=%d] Deleting ad: %s", chat_id, " ".join(cmd))
-    rc, output = await _run_bot_with_retry(chat_id, cmd, cfg_path)
-
-    if rc == 0:
-        _set_ad_inactive(ad_file)
-
-    return rc, output
+async def _store_online_snapshot(
+    chat_id: int, online: list[ad_store.OnlineAd], *, announce: bool = False
+) -> None:
+    if ad_store.update_health(chat_id, True, None, None):
+        await BOT.send_message(chat_id, "✅ Der Zugriff auf Kleinanzeigen klappt wieder.")
+    await _send_sync_report(chat_id, ad_store.apply_sync(chat_id, online), announce)
 
 
-def _set_ad_inactive(ad_file: Path) -> None:
-    """Set active: false in an ad.yaml file (best-effort, line-based)."""
+async def sync_account(chat_id: int, *, announce: bool = False) -> bool:
+    """Refresh the online snapshot. Failures are reported once per failure type."""
     try:
-        text = ad_file.read_text(encoding="utf-8")
-        text = re.sub(r"(?m)^active:\s*(true|false)\s*$", "active: false", text)
-        if "active:" not in text:
-            text = "active: false\n" + text
-        ad_file.write_text(text, encoding="utf-8")
-        log.info("Deactivated %s", ad_file)
-    except OSError as e:
-        log.error("Failed to deactivate %s: %s", ad_file, e)
-
-
-def _list_user_ads(chat_id: int) -> list[dict]:
-    """Return a list of ad metadata dicts for all ad.yaml files of a user.
-
-    Each dict has: path, title, price, active, ad_id.
-    Only ad.yaml files inside the user's work dir are considered.
-    """
-    work_dir = _user_work_dir(chat_id)
-    if not work_dir.exists():
-        return []
-    ads = []
-    for ad_yaml in sorted(work_dir.glob("*/*.yaml")):
-        try:
-            text = ad_yaml.read_text(encoding="utf-8")
-        except OSError:
-            continue
-
-        def _field(key: str, default: str = "") -> str:
-            m = re.search(rf"(?m)^{key}:\s*(.+?)\s*$", text)
-            if not m:
-                return default
-            v = m.group(1).strip().strip('"').strip("'")
-            return v
-
-        active_raw = _field("active", "true").lower()
-        ads.append(
-            {
-                "path": ad_yaml,
-                "title": _field("title", ad_yaml.parent.name),
-                "price": _field("price", "?"),
-                "active": active_raw not in ("false", "0", "no"),
-                "ad_id": _field("id", ""),
-            }
-        )
-    return ads
+        online = await bot_runner.list_online(chat_id)
+    except BotFailure as e:
+        log.error("[chat=%d] online check failed: %s", chat_id, e)
+        if e.kind == "config":
+            return False
+        if ad_store.update_health(chat_id, False, e.kind, str(e)) or announce:
+            await BOT.send_message(
+                chat_id, f"⚠️ Online-Abgleich fehlgeschlagen: {_describe_failure(e)}"
+            )
+        return False
+    await _store_online_snapshot(chat_id, online, announce=announce)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -658,30 +583,36 @@ async def send_lunch_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def republish_kleinanzeigen(context: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback: re-run kleinanzeigen-bot for every allowed user daily."""
-    if not KLEINANZEIGEN_BOT_CMD:
-        return
     log.info("Daily republish run for %d user(s)", len(ALLOWED_USER_IDS))
     for user_id in ALLOWED_USER_IDS:
-        cfg_path = _user_config_path(user_id)
-        if not cfg_path.exists():
-            log.info("[chat=%d] No config.yaml – skipping republish", user_id)
-            continue
         try:
-            rc, output = await run_kleinanzeigen_bot(user_id, ads_filter="due")
-        except Exception as e:
+            result = await bot_runner.publish_due(user_id)
+        except BotFailure as e:
             log.error("[chat=%d] republish failed: %s", user_id, e)
             continue
-        if rc == 0:
+        if result.returncode == 0:
             log.info("[chat=%d] republish succeeded", user_id)
-        else:
-            log.error("[chat=%d] republish failed (rc=%d):\n%s", user_id, rc, output)
-            try:
-                await context.bot.send_message(
-                    user_id,
-                    f"⚠️ Tägliche Neu-Veröffentlichung fehlgeschlagen (rc={rc})",
-                )
-            except Exception as notify_err:
-                log.error("[chat=%d] failed to notify user: %s", user_id, notify_err)
+            continue
+        log.error(
+            "[chat=%d] republish failed (rc=%d):\n%s",
+            user_id,
+            result.returncode,
+            result.output,
+        )
+        await context.bot.send_message(
+            user_id,
+            f"⚠️ Tägliche Neu-Veröffentlichung fehlgeschlagen (rc={result.returncode})",
+        )
+
+
+async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: check all accounts at a slightly varying time."""
+    await asyncio.sleep(random.uniform(0, SYNC_MAX_JITTER_SECONDS))
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await sync_account(user_id)
+        except Exception:
+            log.exception("[chat=%d] scheduled online check failed", user_id)
 
 
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -702,51 +633,95 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _sync_is_stale(chat_id: int) -> bool:
+    synced_at = ad_store.load_state(chat_id)["synced_at"]
+    if not synced_at:
+        return True
+    age = datetime.datetime.now(datetime.UTC) - datetime.datetime.fromisoformat(synced_at)
+    return age > SYNC_MAX_AGE
+
+
+def _render_ad_list(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    view = ad_store.overview(chat_id)
+    ads = [a for a in view["ads"] if a["status"] != "sold"]
+    counts = [
+        f"{label}: {n}"
+        for status, label in STATUS_LABELS.items()
+        if (n := sum(a["status"] == status for a in view["ads"]))
+    ]
+    if view["synced_at"]:
+        checked = (
+            datetime.datetime.fromisoformat(view["synced_at"])
+            .astimezone(LUNCH_PLAN_TZ)
+            .strftime("%d.%m. %H:%M")
+        )
+        lines = [f"Stand online: {checked}"]
+    else:
+        lines = ["Noch kein Online-Abgleich erfolgreich."]
+    if not view["health"]["ok"]:
+        lines.append("⚠️ Der letzte Abgleich ist fehlgeschlagen, der Stand kann veraltet sein.")
+    lines.extend(counts)
+    if view["online_only"]:
+        lines.append("\nNur online vorhanden:")
+        lines.extend(f"• {a['title']}" for a in view["online_only"])
+    order = list(STATUS_LABELS).index
+    priority = {"missing": 0, "unknown": 1, "draft": 2}
+    ads.sort(key=lambda a: (priority.get(a["status"], 3), order(a["status"]), a["title"]))
+    # Telegram allows at most 100 inline buttons per message.
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{STATUS_LABELS[a['status']].split()[0]} {a['title'][:45]}",
+                callback_data=f"ad:{a['key']}",
+            )
+        ]
+        for a in ads[:100]
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _show_ad_list(chat_id: int) -> None:
+    try:
+        if _sync_is_stale(chat_id):
+            await sync_account(chat_id)
+        text, markup = _render_ad_list(chat_id)
+        await BOT.send_message(chat_id, text[:TELEGRAM_MESSAGE_LIMIT], reply_markup=markup)
+    except Exception:
+        log.exception("[chat=%d] showing ads failed", chat_id)
+        await BOT.send_message(chat_id, "Fehler beim Anzeigen der Inserate.")
+
+
 async def cmd_inserate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all ads for the user with per-ad management buttons."""
+    """Show all ads with their online status; tapping one opens its actions."""
     chat_id = update.effective_chat.id
-    ads = _list_user_ads(chat_id)
-    if not ads:
+    if not ad_store.list_local_ads(chat_id) and not KLEINANZEIGEN_BOT_CMD:
         await update.message.reply_text("Keine lokalen Inserate gefunden.")
         return
+    if _sync_is_stale(chat_id):
+        await update.message.reply_text("🔍 Prüfe den Stand auf Kleinanzeigen…")
+    # A browser run takes a while, so don't block other incoming updates.
+    context.application.create_task(_show_ad_list(chat_id))
 
-    for ad in ads:
-        status = "🟢 aktiv" if ad["active"] else "🔴 inaktiv"
-        ad_id_label = f"  _(ID: {ad['ad_id']})_" if ad["ad_id"] else ""
-        caption = (
-            f"*{escape_md(ad['title'])}*{ad_id_label}\n"
-            f"Preis: {ad['price']} EUR  ·  {status}"
-        )
-        path_str = str(ad["path"])
-        rows = []
-        if ad["active"]:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "🗑 Löschen (Site + lokal)",
-                        callback_data=f"del:{path_str}",
-                    ),
-                    InlineKeyboardButton(
-                        "⏸ Deaktivieren (nur lokal)",
-                        callback_data=f"deact:{path_str}",
-                    ),
-                ]
-            )
-        else:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "▶️ Reaktivieren",
-                        callback_data=f"react:{path_str}",
-                    ),
-                ]
-            )
-        await context.bot.send_message(
-            chat_id,
-            caption,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+
+def _ad_actions(entry: dict) -> InlineKeyboardMarkup | None:
+    key, status = entry["key"], entry["status"]
+    sold = InlineKeyboardButton("💰 Verkauft", callback_data=f"sold:{key}")
+    delete = InlineKeyboardButton("🗑 Online löschen", callback_data=f"del:{key}")
+    deactivate = InlineKeyboardButton("⏸ Lokal deaktivieren", callback_data=f"deact:{key}")
+    reactivate = InlineKeyboardButton("▶️ Lokal aktivieren", callback_data=f"react:{key}")
+    match status:
+        case "online" | "reserved":
+            rows = [[sold, delete]]
+            rows.append([deactivate if entry["local_active"] else reactivate])
+        case "missing" | "unknown":
+            rows = [[sold, deactivate]]
+        case "draft":
+            rows = [[deactivate]]
+        case "inactive":
+            rows = [[reactivate]]
+        case _:
+            return None
+    return InlineKeyboardMarkup(rows)
 
 
 async def cmd_neu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1024,104 +999,153 @@ async def _process_photos(
 
 
 async def handle_publish_job(job_data: dict) -> tuple[bool, str]:
-    """Handler for publish_ad jobs. Returns (success, message)."""
+    """Publish exactly the ad of this job and confirm it received an ID."""
     chat_id = job_data["chat_id"]
-    ad_file = job_data.get("ad_file", "unknown")  # kept for logging only
-    log.info("[chat=%d] Publishing ad from %s", chat_id, ad_file)
+    ad_file = Path(job_data.get("ad_file", ""))
+    ad = ad_store.load_ad_file(chat_id, ad_file)
+    if not ad:
+        return False, "Die Inseratsdatei wurde nicht gefunden."
+    if ad.ad_id:  # An earlier attempt already went through.
+        return True, f"✅ Anzeige geschaltet: {ad.title} (ID {ad.ad_id})"
 
+    # `publish --ads new` takes every ad without an ID, so park the others.
+    parked = [
+        other.path
+        for other in ad_store.list_local_ads(chat_id)
+        if other.active and not other.ad_id and other.path != ad_file
+    ]
+    for path in parked:
+        ad_store.set_active(path, False)
     try:
-        rc, output = await run_kleinanzeigen_bot(chat_id)
-    except Exception as e:
-        log.exception("[chat=%d] publish handler failed", chat_id)
-        return False, f"Exception: {e}"
+        result = await bot_runner.publish_new(chat_id)
+    except BotFailure as e:
+        return False, _describe_failure(e)
+    finally:
+        for path in parked:
+            ad_store.set_active(path, True)
 
-    if rc == 0:
-        log.info("[chat=%d] kleinanzeigen-bot succeeded:\n%s", chat_id, output)
-        return True, "✅ Anzeige geschaltet!"
-    else:
-        log.error(
-            "[chat=%d] kleinanzeigen-bot failed (rc=%d):\n%s", chat_id, rc, output
-        )
-        return False, f"Kleinanzeigen-Bot Fehler (rc={rc})"
+    ad = ad_store.load_ad_file(chat_id, ad_file)
+    if ad and ad.ad_id:
+        await sync_account(chat_id)
+        return True, f"✅ Anzeige geschaltet: {ad.title} (ID {ad.ad_id})"
+    log.error("[chat=%d] publish failed (rc=%d):\n%s", chat_id, result.returncode, result.output)
+    if "condition_s" in result.output:
+        # Next attempt without the attribute this category does not accept.
+        _strip_condition(ad_file)
+    kind = bot_runner.classify_failure(result.output)
+    hint = FAILURE_HINTS.get(kind, "Details stehen im Log.")
+    return False, f"Das Schalten ist fehlgeschlagen: {hint}"
 
 
 async def handle_delete_job(job_data: dict) -> tuple[bool, str]:
-    """Handler for delete_ad jobs. Returns (success, message)."""
+    """Remove an ad from the site, verify it, and update the local state."""
     chat_id = job_data["chat_id"]
     ad_file = Path(job_data["ad_file"])
-    log.info("[chat=%d] Deleting ad %s", chat_id, ad_file)
+    is_sale = bool(job_data.get("sold"))
+    ad = ad_store.load_ad_file(chat_id, ad_file)
+    if not ad:
+        return False, "Die Inseratsdatei wurde nicht gefunden."
 
-    try:
-        rc, output = await run_kleinanzeigen_bot_delete(chat_id, ad_file)
-    except Exception as e:
-        log.exception("[chat=%d] delete handler failed", chat_id)
-        return False, f"Exception: {e}"
+    online = None
+    if ad.ad_id:
+        try:
+            online = await bot_runner.list_online(chat_id)
+            if any(o.ad_id == ad.ad_id for o in online):
+                # The bot ignores inactive ad files.
+                ad_store.set_active(ad_file, True)
+                try:
+                    result = await bot_runner.delete_online(chat_id, ad.ad_id)
+                    log.info("[chat=%d] delete output:\n%s", chat_id, result.output)
+                    online = await bot_runner.list_online(chat_id)
+                finally:
+                    ad_store.set_active(ad_file, ad.active)
+                if any(o.ad_id == ad.ad_id for o in online):
+                    return False, f"«{ad.title}» ist weiterhin online."
+        except BotFailure as e:
+            return False, _describe_failure(e)
 
-    if rc == 0:
-        log.info("[chat=%d] delete succeeded:\n%s", chat_id, output)
-        return True, "✅ Inserat gelöscht und deaktiviert."
-    else:
-        log.error("[chat=%d] delete failed (rc=%d):\n%s", chat_id, rc, output)
-        return False, f"Löschen fehlgeschlagen (rc={rc})"
+    ad_store.set_active(ad_file, False)
+    if is_sale:
+        ad_store.record_sold(chat_id, ad)
+    if online is not None:
+        await _store_online_snapshot(chat_id, online)
+    if is_sale:
+        return True, f"💰 Als verkauft eingetragen: {ad.title}"
+    return True, f"✅ Nicht mehr online und lokal deaktiviert: {ad.title}"
+
+
+async def handle_sync_job(job_data: dict) -> tuple[bool, str]:
+    """Refresh the online snapshot. sync_account reports results itself."""
+    await sync_account(job_data["chat_id"], announce=bool(job_data.get("announce")))
+    return True, ""
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
+    if q.from_user.id not in ALLOWED_USER_IDS:
+        log.warning("Ignored button press from user %s", q.from_user.id)
+        return
     chat_id = update.effective_chat.id
     log.info("[chat=%d] button pressed: %r", chat_id, q.data)
 
-    # ── Ad management (del: / deact: / react:) ───────────────────────────
-    for prefix, action in (
-        ("del:", "delete"),
-        ("deact:", "deactivate"),
-        ("react:", "reactivate"),
-    ):
-        if q.data.startswith(prefix):
-            ad_file = Path(q.data[len(prefix) :])
-            await q.edit_message_reply_markup(reply_markup=None)
-
-            if action == "delete":
-                if not KLEINANZEIGEN_BOT_CMD:
-                    await context.bot.send_message(
-                        chat_id,
-                        "⚠️ KLEINANZEIGEN_BOT_CMD nicht konfiguriert – kann nicht löschen.",
-                    )
-                    return
-                job_id = str(uuid.uuid4())
-                QUEUE_MANAGER.enqueue(
-                    job_id=job_id,
-                    chat_id=chat_id,
-                    job_type="delete_ad",
-                    data={"ad_file": str(ad_file), "chat_id": chat_id},
-                )
-                await context.bot.send_message(
-                    chat_id,
-                    f"⏳ Inserat wird gelöscht…\n_Job-ID: {job_id[:8]}_",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-
-            elif action == "deactivate":
-                _set_ad_inactive(ad_file)
-                await context.bot.send_message(
-                    chat_id,
-                    "⏸ Inserat lokal deaktiviert (wird nicht mehr republiziert).",
-                )
-
-            elif action == "reactivate":
-                try:
-                    text = ad_file.read_text(encoding="utf-8")
-                    text = re.sub(
-                        r"(?m)^active:\s*(true|false)\s*$", "active: true", text
-                    )
-                    ad_file.write_text(text, encoding="utf-8")
-                    await context.bot.send_message(
-                        chat_id,
-                        "▶️ Inserat reaktiviert – wird beim nächsten Lauf neu geschaltet.",
-                    )
-                except OSError as e:
-                    await context.bot.send_message(chat_id, f"Fehler: {e}")
+    # ── Ad management ───────────────────────────────────────────────────
+    if q.data == "nop":
+        await q.edit_message_text("Abgebrochen.")
+        return
+    action, separator, ad_key = q.data.partition(":")
+    if separator and action in {"ad", "del", "sold", "deact", "react"}:
+        ad = ad_store.find_ad(chat_id, ad_key)
+        if not ad:
+            await context.bot.send_message(chat_id, "Dieses Inserat gibt es nicht mehr.")
             return
+
+        if action == "ad":
+            view = ad_store.overview(chat_id)
+            entry = next(a for a in view["ads"] if a["key"] == ad_key)
+            expires = f"\nLäuft ab: {entry['expires']}" if entry["expires"] else ""
+            await context.bot.send_message(
+                chat_id,
+                f"{ad.title}\nPreis: {ad.price} EUR\n"
+                f"Status: {STATUS_LABELS[entry['status']]}{expires}",
+                reply_markup=_ad_actions(entry),
+            )
+            return
+
+        await q.edit_message_reply_markup(reply_markup=None)
+        if action in {"del", "sold"}:
+            if not KLEINANZEIGEN_BOT_CMD:
+                await context.bot.send_message(
+                    chat_id, "⚠️ KLEINANZEIGEN_BOT_CMD ist nicht konfiguriert."
+                )
+                return
+            job_id = str(uuid.uuid4())
+            QUEUE_MANAGER.enqueue(
+                job_id=job_id,
+                chat_id=chat_id,
+                job_type="delete_ad",
+                data={
+                    "ad_file": str(ad.path),
+                    "chat_id": chat_id,
+                    "sold": action == "sold",
+                },
+            )
+            await context.bot.send_message(
+                chat_id, f"⏳ Wird erledigt: {ad.title} (Job {job_id[:8]})"
+            )
+        else:
+            try:
+                ad_store.set_active(ad.path, action == "react")
+            except OSError as e:
+                await context.bot.send_message(chat_id, f"Fehler: {e}")
+                return
+            text = (
+                "▶️ Lokal aktiviert."
+                if action == "react"
+                else "⏸ Lokal deaktiviert. Online ändert das nichts."
+            )
+            await context.bot.send_message(chat_id, f"{text} ({ad.title})")
+        return
 
     # ── Lunch plan confirmation ────────────────────────────────────────────
     if q.data == "plan_accept":
@@ -1183,6 +1207,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
         try:
             ad_file = write_ad_files(d, chat_id)
+        except ValueError as e:
+            await context.bot.send_message(chat_id, str(e))
+            return
         except Exception as e:
             log.exception("Failed to write ad files")
             await context.bot.send_message(chat_id, f"Fehler beim Speichern: {e}")
@@ -1217,7 +1244,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    global QUEUE_MANAGER, BACKGROUND_WORKER
+    global BOT, QUEUE_MANAGER, BACKGROUND_WORKER
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1237,21 +1264,24 @@ def main() -> None:
     job_handlers = {
         "publish_ad": handle_publish_job,
         "delete_ad": handle_delete_job,
+        "sync_ads": handle_sync_job,
     }
 
     app = Application.builder().token(token).build()
+    BOT = app.bot
 
     # Create job completion callback that uses app.bot
     async def notify_job_completion(
         job_id: str, chat_id: int, success: bool, message: str
     ) -> None:
         """Notify user about job completion."""
-        notification = f"✅ {message}" if success else f"❌ Fehler: {message}"
+        if success and not message:
+            return
+        notification = message if success else f"❌ Fehler: {message}"
         try:
             await app.bot.send_message(
                 chat_id,
                 notification,
-                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             log.error(
@@ -1270,6 +1300,41 @@ def main() -> None:
     # Register post_init to start the background worker
     async def post_init(app: Application) -> None:
         await BACKGROUND_WORKER.start()
+        loop = asyncio.get_running_loop()
+
+        def request_confirmation(chat_id: int, action: str, ad: ad_store.LocalAd) -> None:
+            """Called from agent threads; the user decides via buttons."""
+            question, prefix = (
+                ("wirklich als verkauft eintragen", "sold")
+                if action == "sold"
+                else ("wirklich online löschen", "del")
+            )
+            asyncio.run_coroutine_threadsafe(
+                app.bot.send_message(
+                    chat_id,
+                    f"«{ad.title}» {question}?",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "✅ Ja", callback_data=f"{prefix}:{ad.key}"
+                                ),
+                                InlineKeyboardButton("❌ Nein", callback_data="nop"),
+                            ]
+                        ]
+                    ),
+                ),
+                loop,
+            )
+
+        set_confirmation_fn(request_confirmation)
+        if KLEINANZEIGEN_BOT_CMD:
+            for sync_time in SYNC_TIMES:
+                app.job_queue.run_daily(
+                    scheduled_sync,
+                    time=sync_time.replace(tzinfo=LUNCH_PLAN_TZ),
+                    name=f"kleinanzeigen_sync_{sync_time:%H%M}",
+                )
         # Schedule daily lunch plan message at 08:30 Europe/Berlin
         app.job_queue.run_daily(
             send_lunch_plan,
@@ -1307,7 +1372,9 @@ def main() -> None:
     app.add_handler(CommandHandler("plan", cmd_plan, filters=user_filter))
     app.add_handler(CommandHandler("queue", cmd_queue_status, filters=user_filter))
     app.add_handler(CommandHandler("backout", cmd_backout_jobs, filters=user_filter))
-    app.add_handler(CommandHandler("retry", cmd_retry_job, filters=user_filter))
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^/retry_\S+") & user_filter, cmd_retry_job)
+    )
     app.add_handler(MessageHandler(filters.PHOTO & user_filter, on_photo))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, on_text)

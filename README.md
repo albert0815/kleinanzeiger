@@ -109,11 +109,23 @@ The bot will:
 
 - `/start` or `/help` - Show welcome message
 - `/neu` - Discard current draft and start fresh
+- `/inserate` - Show ads with their online status; tap an ad for its actions
 - `/queue` - Check queue status (pending/backout jobs)
 - `/backout` - List failed jobs for this chat
 - `/retry_<job_id>` - Retry a specific failed job
 
 Example: `/retry_a1b2c3d4` (use the 8-character job ID from `/backout`)
+
+## Online Sync
+
+The bot keeps a snapshot of what is online in `<base>/<chat_id>/agent-state.json`.
+It is refreshed by `/inserate` when older than 15 minutes, after every change made
+through the bot, on request in the chat, and twice a day at slightly varying times.
+You are told once about new differences and once when access fails or recovers.
+
+Automatic republishing is off. Set `KLEINANZEIGEN_AUTO_REPUBLISH=true` to enable it.
+
+Run the tests with `python -m unittest test_ad_management`.
 
 ## Queue System
 

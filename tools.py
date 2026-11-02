@@ -11,15 +11,12 @@ from __future__ import annotations
 import contextvars
 import datetime
 import logging
-import os
-import re
 import uuid
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import yaml
 from strands import tool
 
+import ad_store
 import mahlino
 
 log = logging.getLogger("kleinanzeigen-agent.tools")
@@ -38,45 +35,6 @@ def set_agent_chat_id(chat_id: int) -> None:
     """Set the active chat_id for the current async task / thread context."""
     _chat_id_ctx.set(chat_id)
 
-
-def _base_dir() -> Path:
-    return Path(
-        os.environ.get(
-            "KLEINANZEIGEN_BASE_DIR",
-            "/docker-volumes/kleinanzeiger/kleinanzeigen-config",
-        )
-    )
-
-
-def _list_ads_internal(chat_id: int) -> list[dict]:
-    """Read all ad.yaml files for a user and return structured dicts."""
-    work_dir = _base_dir() / str(chat_id) / "ads"
-    if not work_dir.is_dir():
-        return []
-    ads = []
-    for idx, ad_yaml in enumerate(sorted(work_dir.glob("*/*.yaml"))):
-        try:
-            data = yaml.safe_load(ad_yaml.read_text(encoding="utf-8")) or {}
-        except Exception:
-            continue
-        ads.append(
-            {
-                "index": idx,
-                "path": ad_yaml,
-                "title": data.get("title", "(kein Titel)"),
-                "price": data.get("price", "?"),
-                "active": bool(data.get("active", True)),
-                "ad_id": data.get("id"),
-            }
-        )
-    return ads
-
-
-def _set_active_flag(ad_file: Path, *, active: bool) -> None:
-    text = ad_file.read_text(encoding="utf-8")
-    value = "true" if active else "false"
-    text = re.sub(r"(?m)^active:\s*(true|false)\s*$", f"active: {value}", text)
-    ad_file.write_text(text, encoding="utf-8")
 
 _TZ = ZoneInfo("Europe/Berlin")
 
@@ -185,10 +143,11 @@ def save_lunch_plan(date: str, recipes: list[dict], **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Kleinanzeigen publish tool
+# Kleinanzeigen management tools
 # ---------------------------------------------------------------------------
 
 _queue_enqueue_fn = None
+_request_confirmation_fn = None
 
 
 def set_queue_enqueue_fn(fn) -> None:
@@ -197,123 +156,115 @@ def set_queue_enqueue_fn(fn) -> None:
     _queue_enqueue_fn = fn
 
 
+def set_confirmation_fn(fn) -> None:
+    """Register fn(chat_id, action, ad) that asks the user via Telegram buttons."""
+    global _request_confirmation_fn
+    _request_confirmation_fn = fn
+
+
+def _ask_confirmation(action: str, ad_key: str) -> str:
+    chat_id = _chat_id_ctx.get()
+    if chat_id is None:
+        return "Fehler: Kein Nutzerkontext verfügbar."
+    if _request_confirmation_fn is None:
+        return "Fehler: Bestätigung nicht verfügbar."
+    ad = ad_store.find_ad(chat_id, ad_key)
+    if not ad:
+        return f"Fehler: Kein Inserat mit Schlüssel {ad_key} gefunden."
+    _request_confirmation_fn(chat_id, action, ad)
+    return (
+        f"Der Nutzer wurde per Button um Bestätigung für «{ad.title}» gebeten. "
+        "Die Aktion ist noch nicht ausgeführt."
+    )
+
+
 @tool
-def publish_kleinanzeigen_ad(ad_yaml_path: str) -> str:
-    """Queue a Kleinanzeigen.de ad for publishing via the background worker.
+def list_kleinanzeigen_ads() -> dict:
+    """Show the user's ads, comparing local files with the last online snapshot.
 
-    Args:
-        ad_yaml_path: Absolute path to the ad.yaml file prepared for this listing.
+    Returns:
+    - synced_at: UTC time of the last online check, null if there was none
+    - health: result of the last online check; ok is false if it failed
+    - ads: entries with key (use it for the other tools), title, price, ad_id,
+      expires, expiring_soon and status. status is one of: online, reserved,
+      missing (locally active but not online), draft (never published),
+      inactive, sold, unknown (no online check yet)
+    - online_only: ads that are online but have no local file
 
-    Returns a confirmation string with the job ID, or an error message.
+    Always mention synced_at. Call refresh_kleinanzeigen_status if it is old.
     """
+    chat_id = _chat_id_ctx.get()
+    if chat_id is None:
+        return {"error": "Kein Nutzerkontext verfügbar."}
+    return ad_store.overview(chat_id)
+
+
+@tool
+def refresh_kleinanzeigen_status() -> str:
+    """Queue a fresh online check. The user is told about differences afterwards."""
     chat_id = _chat_id_ctx.get()
     if chat_id is None:
         return "Fehler: Kein Nutzerkontext verfügbar."
     if _queue_enqueue_fn is None:
         return "Fehler: Warteschlange nicht initialisiert."
-
-    job_id = str(uuid.uuid4())
     _queue_enqueue_fn(
-        job_id=job_id,
+        job_id=str(uuid.uuid4()),
         chat_id=chat_id,
-        job_type="publish_ad",
-        data={"ad_file": ad_yaml_path, "chat_id": chat_id},
+        job_type="sync_ads",
+        data={"chat_id": chat_id, "announce": True},
+        max_retries=1,
     )
-    log.info("[chat=%d job=%s] Publish job queued via tool", chat_id, job_id)
-    return f"Anzeige wird geschaltet (Job-ID: {job_id[:8]})."
+    return "Online-Abgleich wurde gestartet."
 
 
 @tool
-def list_kleinanzeigen_ads() -> list[dict]:
-    """List all local Kleinanzeigen.de ads for the current user.
-
-    Returns a list of ads. Each entry contains:
-    - index: integer – use this to reference the ad in delete/deactivate tools
-    - title: ad title
-    - price: price in EUR
-    - active: true if the ad is active (will be republished); false if deactivated
-    - ad_id: Kleinanzeigen.de listing ID if already published (may be null)
-
-    Call this before delete_kleinanzeigen_ad or deactivate_kleinanzeigen_ad
-    to find the correct index for the ad the user is referring to.
-    """
-    chat_id = _chat_id_ctx.get()
-    if chat_id is None:
-        return []
-    return [
-        {k: v for k, v in ad.items() if k != "path"}
-        for ad in _list_ads_internal(chat_id)
-    ]
-
-
-@tool
-def delete_kleinanzeigen_ad(ad_index: int) -> str:
-    """Delete a Kleinanzeigen.de ad from the site AND deactivate it locally.
-
-    This queues a background job that opens a browser, removes the ad from
-    Kleinanzeigen.de, and then sets active: false in the local YAML so it
-    won't be republished.
-
-    Use list_kleinanzeigen_ads() first to find the correct index.
+def search_kleinanzeigen_categories(query: str) -> list[str]:
+    """Find valid category names. Use one of them exactly in the ad JSON.
 
     Args:
-        ad_index: the 'index' value returned by list_kleinanzeigen_ads()
+        query: words to search for, e.g. "Kinderschuhe"
+    """
+    return ad_store.search_categories(query)
 
-    Returns a confirmation or error message.
+
+@tool
+def delete_kleinanzeigen_ad(ad_key: str) -> str:
+    """Ask the user to confirm deleting an ad online. Nothing is deleted yet.
+
+    Args:
+        ad_key: the 'key' value returned by list_kleinanzeigen_ads()
+    """
+    return _ask_confirmation("delete", ad_key)
+
+
+@tool
+def mark_kleinanzeigen_ad_sold(ad_key: str) -> str:
+    """Ask the user to confirm that an ad is sold. Nothing is changed yet.
+
+    After confirmation it is removed from the site if needed and recorded as sold.
+
+    Args:
+        ad_key: the 'key' value returned by list_kleinanzeigen_ads()
+    """
+    return _ask_confirmation("sold", ad_key)
+
+
+@tool
+def deactivate_kleinanzeigen_ad(ad_key: str) -> str:
+    """Mark an ad inactive locally. It stays online until it expires or is deleted.
+
+    Args:
+        ad_key: the 'key' value returned by list_kleinanzeigen_ads()
     """
     chat_id = _chat_id_ctx.get()
     if chat_id is None:
         return "Fehler: Kein Nutzerkontext verfügbar."
-    if _queue_enqueue_fn is None:
-        return "Fehler: Warteschlange nicht initialisiert."
-    if not os.environ.get("KLEINANZEIGEN_BOT_CMD", ""):
-        return "Fehler: KLEINANZEIGEN_BOT_CMD nicht konfiguriert."
-
-    ads = _list_ads_internal(chat_id)
-    matches = [a for a in ads if a["index"] == ad_index]
-    if not matches:
-        return f"Fehler: Kein Inserat mit Index {ad_index} gefunden. Bitte list_kleinanzeigen_ads() aufrufen."
-    ad = matches[0]
-
-    job_id = str(uuid.uuid4())
-    _queue_enqueue_fn(
-        job_id=job_id,
-        chat_id=chat_id,
-        job_type="delete_ad",
-        data={"ad_file": str(ad["path"]), "chat_id": chat_id},
-    )
-    log.info("[chat=%d job=%s] Delete job queued for '%s'", chat_id, job_id, ad["title"])
-    return f"Inserat «{ad['title']}» wird gelöscht (Job-ID: {job_id[:8]})."
-
-
-@tool
-def deactivate_kleinanzeigen_ad(ad_index: int) -> str:
-    """Deactivate a Kleinanzeigen.de ad locally WITHOUT deleting it from the site.
-
-    Sets active: false in the local YAML so the ad won't be republished.
-    The listing remains live on Kleinanzeigen.de until it expires or is manually deleted.
-
-    Use list_kleinanzeigen_ads() first to find the correct index.
-
-    Args:
-        ad_index: the 'index' value returned by list_kleinanzeigen_ads()
-
-    Returns a confirmation or error message.
-    """
-    chat_id = _chat_id_ctx.get()
-    if chat_id is None:
-        return "Fehler: Kein Nutzerkontext verfügbar."
-
-    ads = _list_ads_internal(chat_id)
-    matches = [a for a in ads if a["index"] == ad_index]
-    if not matches:
-        return f"Fehler: Kein Inserat mit Index {ad_index} gefunden. Bitte list_kleinanzeigen_ads() aufrufen."
-    ad = matches[0]
-
+    ad = ad_store.find_ad(chat_id, ad_key)
+    if not ad:
+        return f"Fehler: Kein Inserat mit Schlüssel {ad_key} gefunden."
     try:
-        _set_active_flag(ad["path"], active=False)
+        ad_store.set_active(ad.path, False)
     except OSError as e:
         return f"Fehler beim Schreiben: {e}"
-
-    log.info("[chat=%d] Deactivated ad '%s' locally", chat_id, ad["title"])
-    return f"Inserat «{ad['title']}» lokal deaktiviert – wird nicht mehr republiziert."
+    log.info("[chat=%d] Deactivated ad '%s' locally", chat_id, ad.title)
+    return f"Inserat «{ad.title}» lokal deaktiviert."

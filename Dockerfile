@@ -57,6 +57,7 @@ RUN apt-get update \
 
 COPY --from=kleinanzeigen-bot-build /opt/kleinanzeigen-bot-src/dist/kleinanzeigen-bot /usr/local/bin/kleinanzeigen
 RUN chmod +x /usr/local/bin/kleinanzeigen
+COPY --from=kleinanzeigen-bot-build /opt/kleinanzeigen-bot-src/src/kleinanzeigen_bot/resources/categories.yaml /app/resources/categories.yaml
 
 # Install Python dependencies
 COPY --chown=appuser pyproject.toml uv.lock ./
@@ -64,7 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 # Copy application source
-COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ./
+COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ad_store.py bot_runner.py ./
 COPY --chown=appuser skills/ ./skills/
 
 USER appuser
