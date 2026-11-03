@@ -37,7 +37,9 @@ jobs:
             echo "MAHLINO_API_KEY=${MAHLINO_API_KEY}"
             echo "KLEINANZEIGEN_BOT_CMD=/usr/local/bin/kleinanzeigen"
             echo "KLEINANZEIGEN_BASE_DIR=/docker-volumes/kleinanzeiger/kleinanzeigen-config"
-            echo "KLEINANZEIGEN_AUTO_REPUBLISH=true"
+            # Paused: kleinanzeigen-bot cannot read the redesigned category dialog
+            # (2026-11-03, "Category dialog has no unique match"). Re-enable after an upstream fix.
+            echo "KLEINANZEIGEN_AUTO_REPUBLISH=false"
             # nodriver's Chrome DevTools connect-retry loop (see scripts/patch_nodriver_connect_timeout.py);
             # increased from the 5x/2s/0.5s upstream defaults since this host's load can make Chrome's
             # cold start lose that race even though the browser itself works fine.
