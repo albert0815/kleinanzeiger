@@ -23,12 +23,18 @@ RUN pip install --no-cache-dir pdm \
     && git -C /opt/kleinanzeigen-bot-src checkout --detach FETCH_HEAD
 
 COPY scripts/patch_nodriver_connect_timeout.py /opt/patch_nodriver_connect_timeout.py
+# Reads the labels of the redesigned category dialog; see the script for why.
+COPY scripts/patch_category_dialog_labels.py /opt/patch_category_dialog_labels.py
+COPY scripts/test_category_dialog_patch.py /opt/test_category_dialog_patch.py
 
 WORKDIR /opt/kleinanzeigen-bot-src
 # `pdm install` runs kleinanzeigen-bot's own post_install hook
 # (scripts/fix_nodriver.py) first; our extra patch is applied on top of that.
 RUN pdm install -v \
     && pdm run python /opt/patch_nodriver_connect_timeout.py \
+    && python /opt/patch_category_dialog_labels.py \
+    && cp /opt/test_category_dialog_patch.py tests/unit/ \
+    && pdm run pytest -q -p no:cacheprovider --no-cov tests/unit/test_category_dialog_patch.py \
     && pdm run compile \
     && ./dist/kleinanzeigen-bot --help
 
