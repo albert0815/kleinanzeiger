@@ -84,20 +84,84 @@ def fetch_plan_sync(start: datetime.date, end: datetime.date) -> list[dict]:
 
 
 def fetch_recipes_sync() -> list[dict]:
+    """All active recipes with their total time, which planning needs."""
     resp = httpx.get(
-        f"{MAHLINO_URL}/api/v1/recipes/planning", headers=_headers(), timeout=_TIMEOUT
+        f"{MAHLINO_URL}/api/v1/recipes",
+        params={"archived": "false"},
+        headers=_headers(),
+        timeout=_TIMEOUT,
     )
     resp.raise_for_status()
     return [
-        {"id": r["slug"], "name": r["title"], "lastPlanDate": r.get("last_cooked")}
+        {
+            "id": r["slug"],
+            "name": r["title"],
+            "lastPlanDate": r.get("last_cooked"),
+            "minutes": ((r.get("prep_minutes") or 0) + (r.get("cook_minutes") or 0)) or None,
+        }
         for r in resp.json()
     ]
 
 
-def save_lunch_entry_sync(day: str, slug: str) -> None:
+def _post_entry(payload: dict) -> None:
     resp = httpx.post(
         f"{MAHLINO_URL}/api/v1/meal-plan/entries",
-        json={"day": day, "meal_type": _MEAL_TYPE, "recipe": slug},
+        json={"meal_type": _MEAL_TYPE, **payload},
+        headers=_headers(),
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def save_lunch_entry_sync(day: str, slug: str) -> None:
+    _post_entry({"day": day, "recipe": slug})
+
+
+def save_lunch_note_sync(day: str, note: str) -> None:
+    _post_entry({"day": day, "note": note})
+
+
+def fetch_entry_ids_sync(day: datetime.date) -> list:
+    """IDs of the lunch entries of a day."""
+    resp = httpx.get(
+        f"{MAHLINO_URL}/api/v1/meal-plan",
+        params={"start": day.isoformat(), "days": 1},
+        headers=_headers(),
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return [
+        entry["id"]
+        for found in resp.json().get("days", [])
+        for entry in found.get("entries", [])
+        if entry.get("meal_type") == _MEAL_TYPE
+    ]
+
+
+def delete_entry_sync(entry_id) -> None:
+    resp = httpx.delete(
+        f"{MAHLINO_URL}/api/v1/meal-plan/entries/{entry_id}",
+        headers=_headers(),
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def add_shopping_item_sync(text: str, quantity: float | None, unit: str | None) -> None:
+    payload = {"text": text, "quantity": quantity, "unit": unit}
+    resp = httpx.post(
+        f"{MAHLINO_URL}/api/v1/shopping-list/items",
+        json={k: v for k, v in payload.items() if v is not None},
+        headers=_headers(),
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def add_days_to_shopping_list_sync(days: list[str]) -> None:
+    resp = httpx.post(
+        f"{MAHLINO_URL}/api/v1/meal-plan/to-shopping-list",
+        json={"days": days, "meal_types": [_MEAL_TYPE]},
         headers=_headers(),
         timeout=_TIMEOUT,
     )

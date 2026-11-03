@@ -37,6 +37,7 @@ from telegram.helpers import escape_markdown
 
 import ad_store
 import bot_runner
+import lunch_plan
 import mahlino
 from agent_registry import clear_agent, get_agent
 from background_worker import BackgroundWorker
@@ -74,6 +75,7 @@ FAILURE_HINTS = {
     "browser": "Der Browser ließ sich nicht starten.",
     "timeout": "Kleinanzeigen hat nicht rechtzeitig geantwortet.",
 }
+WEEKDAYS = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
 ONLINE_STATE_LABELS = {"active": "🟢 online", "reserved": "🟡 reserviert"}
 OTHER_STATE_LABEL = "⚪ deaktiviert"
 
@@ -147,14 +149,13 @@ BOT_COMMANDS = [
     BotCommand("inserate", "Inserate mit Online-Status anzeigen und verwalten"),
     BotCommand("neu", "Entwurf verwerfen und Konversation zurücksetzen"),
     BotCommand("lunch", "Heutiges Mittagessen anzeigen"),
+    BotCommand("woche", "Essensplan der nächsten 7 Tage anzeigen"),
     BotCommand("plan", "Essensplan für nächste Woche vorschlagen"),
     BotCommand("queue", "Status der Warteschlange anzeigen"),
     BotCommand("backout", "Fehlgeschlagene Aufträge anzeigen und wiederholen"),
     BotCommand("help", "Hilfe und alle Befehle anzeigen"),
 ]
 
-# chat_ids that have a pending lunch plan suggestion awaiting confirmation
-PENDING_LUNCH_PLAN: set[int] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -219,15 +220,16 @@ def ad_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def plan_keyboard() -> InlineKeyboardMarkup:
+def plan_keyboard(proposal_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Annehmen & speichern", callback_data="plan_accept"
+                    "✅ Annehmen & speichern", callback_data=f"plan_accept:{proposal_id}"
                 ),
                 InlineKeyboardButton("✏️ Ändern", callback_data="plan_change"),
-            ]
+            ],
+            [InlineKeyboardButton("❌ Verwerfen", callback_data=f"plan_reject:{proposal_id}")],
         ]
     )
 
@@ -547,15 +549,50 @@ def format_lunch_message(plan_entries: list[dict], date: datetime.date) -> str:
     lines = [f"🍽️ *Mittagessen am {date_label}*\n"]
     for recipe in entry["recipes"]:
         name = escape_md(recipe.get("name", "?"))
-        cat = recipe.get("category", "")
         duration = recipe.get("duration", "")
-        parts = [f"*{name}*"]
-        if cat:
-            parts.append(escape_md(cat))
-        if duration:
-            parts.append(f"{duration} min")
-        lines.append("• " + " · ".join(parts))
+        lines.append(f"• *{name}*" + (f" · {duration} min" if duration else ""))
     return "\n".join(lines)
+
+
+def _weekday_label(day: str) -> str:
+    date = datetime.date.fromisoformat(day)
+    return f"{WEEKDAYS[date.weekday()]} {date:%d.%m.}"
+
+
+def format_week(plan_entries: list[dict]) -> str:
+    lines = ["🍽️ Essensplan"]
+    for entry in plan_entries:
+        names = ", ".join(r["name"] for r in entry["recipes"])
+        if not names and lunch_plan.is_no_cooking_day(
+            datetime.date.fromisoformat(entry["date"])
+        ):
+            names = "Mama kocht"
+        lines.append(f"{_weekday_label(entry['date'])}: {names or '–'}")
+    return "\n".join(lines)
+
+
+def format_proposal(proposal: dict) -> str:
+    lines = ["🍽️ Vorschlag für den Essensplan:"]
+    for item in proposal["days"]:
+        target = item["name"] or "Eintrag entfernen"
+        previous = ", ".join(item["previous"])
+        change = f" (statt {previous})" if previous else ""
+        lines.append(f"{_weekday_label(item['date'])}: {target}{change}")
+    return "\n".join(lines)
+
+
+async def announce_lunch_proposal() -> None:
+    """Show a new proposal to the household; anyone can confirm it."""
+    proposal = lunch_plan.take_unannounced()
+    if not proposal:
+        return
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await BOT.send_message(
+                user_id, format_proposal(proposal), reply_markup=plan_keyboard(proposal["id"])
+            )
+        except Exception as e:
+            log.error("Failed to send lunch proposal to user %d: %s", user_id, e)
 
 
 async def _trigger_week_plan(
@@ -563,25 +600,20 @@ async def _trigger_week_plan(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Ask the agent to propose a meal plan for the coming week and present it."""
-
-    trigger = "Bitte erstelle einen Vorschlag für das Mittagessen. "
+    trigger = "Bitte erstelle einen Vorschlag für das Mittagessen."
     try:
-        await _call_agent_streaming(
-            user_id,
-            trigger,
-            context,
-            reply_markup=plan_keyboard(),
-        )
-        PENDING_LUNCH_PLAN.add(user_id)
-        log.info("[chat=%d] Lunch plan suggestion sent.", user_id)
+        await _call_agent_streaming(user_id, trigger, context)
+        await announce_lunch_proposal()
+        log.info("[chat=%d] Lunch plan suggestion finished.", user_id)
     except Exception as e:
         log.error("[chat=%d] Failed to send lunch plan suggestion: %s", user_id, e)
+        await BOT.send_message(user_id, "⚠️ Der Essensplan-Vorschlag ist fehlgeschlagen.")
 
 
 async def send_lunch_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback: send today's lunch plan at 08:30.
 
-    If tomorrow has no meal planned, proactively trigger a week plan suggestion.
+    If tomorrow needs a meal, trigger one proposal for the whole household.
     """
     today = datetime.datetime.now(LUNCH_PLAN_TZ).date()
     tomorrow = today + datetime.timedelta(days=1)
@@ -591,11 +623,13 @@ async def send_lunch_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
         plan_range = await mahlino.fetch_plan(today, tomorrow)
     except Exception as e:
         log.error("Failed to fetch lunch plan: %s", e)
+        for user_id in ALLOWED_USER_IDS:
+            await context.bot.send_message(
+                user_id, "⚠️ Der Essensplan konnte heute nicht abgerufen werden."
+            )
         return
 
     today_msg = format_lunch_message(plan_range, today)
-    tomorrow_has_meal = _has_meal(plan_range, tomorrow)
-
     for user_id in ALLOWED_USER_IDS:
         try:
             await context.bot.send_message(
@@ -603,10 +637,9 @@ async def send_lunch_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception as e:
             log.error("Failed to send today's lunch to user %d: %s", user_id, e)
-            continue
 
-        if not tomorrow_has_meal:
-            await _trigger_week_plan(user_id, context)
+    if lunch_plan.should_propose(plan_range, tomorrow):
+        await _trigger_week_plan(min(ALLOWED_USER_IDS), context)
 
 
 async def republish_kleinanzeigen(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -740,7 +773,6 @@ async def cmd_neu(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     task = ACTIVE_GENERATION_TASKS.pop(chat_id, None)
     if task and not task.done():
         task.cancel()
-    PENDING_LUNCH_PLAN.discard(chat_id)
     clear_agent(chat_id)
     log.info("[chat=%d] /neu — state cleared", chat_id)
     await update.message.reply_text(
@@ -760,6 +792,18 @@ async def cmd_lunch(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg = format_lunch_message(plan, today)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_woche(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the lunches of the next seven days."""
+    today = datetime.datetime.now(LUNCH_PLAN_TZ).date()
+    try:
+        plan = await mahlino.fetch_plan(today, today + datetime.timedelta(days=6))
+    except Exception as e:
+        log.error("cmd_woche: fetch failed: %s", e)
+        await update.message.reply_text("Der Essensplan konnte nicht abgerufen werden.")
+        return
+    await update.message.reply_text(format_week(plan))
 
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -849,17 +893,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if d:
             response = await _call_agent(chat_id, user_request)
         else:
-            markup = plan_keyboard() if chat_id in PENDING_LUNCH_PLAN else None
-            response = await _call_agent_streaming(
-                chat_id,
-                user_request,
-                context,
-                reply_markup=markup,
-            )
+            response = await _call_agent_streaming(chat_id, user_request, context)
     except Exception as e:
         log.exception("[chat=%d] agent call failed", chat_id)
         await context.bot.send_message(chat_id, f"Fehler: {e}")
         return
+    await announce_lunch_proposal()
 
     # If there is an active draft and the response is JSON, update it
     if d:
@@ -1227,23 +1266,41 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # ── Lunch plan confirmation ────────────────────────────────────────────
-    if q.data == "plan_accept":
-        agent = get_agent(chat_id)
-        agent.state["plan_confirmed"] = True
-        PENDING_LUNCH_PLAN.discard(chat_id)
+    if q.data.startswith("plan_accept:"):
         await q.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        today = datetime.datetime.now(LUNCH_PLAN_TZ).date()
         try:
-            await _call_agent_streaming(
-                chat_id,
-                "Bitte speichere den Plan jetzt.",
-                context,
+            result = await asyncio.to_thread(
+                lunch_plan.apply_proposal, q.data.partition(":")[2], today
             )
         except Exception as e:
             log.exception("[chat=%d] plan save failed", chat_id)
-            await context.bot.send_message(chat_id, f"Fehler beim Speichern: {e}")
-        finally:
-            agent.state["plan_confirmed"] = False
+            proposal = lunch_plan.load_proposal()
+            await context.bot.send_message(
+                chat_id,
+                f"Fehler beim Speichern: {e}",
+                reply_markup=plan_keyboard(proposal["id"]) if proposal else None,
+            )
+            return
+        if result is None:
+            await context.bot.send_message(
+                chat_id, "Dieser Vorschlag ist nicht mehr offen oder wurde schon bearbeitet."
+            )
+            return
+        lines = [f"✅ {len(result['saved'])} Tage im Essensplan gespeichert."]
+        if result["skipped"]:
+            days = ", ".join(_weekday_label(i["date"]) for i in result["skipped"])
+            lines.append(f"Nicht übernommen, weil schon geplant oder vorbei: {days}")
+        for user_id in ALLOWED_USER_IDS:
+            await context.bot.send_message(user_id, "\n".join(lines))
+        return
+
+    if q.data.startswith("plan_reject:"):
+        await q.edit_message_reply_markup(reply_markup=None)
+        done = lunch_plan.reject_proposal(q.data.partition(":")[2])
+        await context.bot.send_message(
+            chat_id, "Vorschlag verworfen." if done else "Dieser Vorschlag ist nicht mehr offen."
+        )
         return
 
     if q.data == "plan_change":
@@ -1450,6 +1507,7 @@ def main() -> None:
     app.add_handler(CommandHandler("inserate", cmd_inserate, filters=user_filter))
     app.add_handler(CommandHandler("neu", cmd_neu, filters=user_filter))
     app.add_handler(CommandHandler("lunch", cmd_lunch, filters=user_filter))
+    app.add_handler(CommandHandler("woche", cmd_woche, filters=user_filter))
     app.add_handler(CommandHandler("plan", cmd_plan, filters=user_filter))
     app.add_handler(CommandHandler("queue", cmd_queue_status, filters=user_filter))
     app.add_handler(CommandHandler("backout", cmd_backout_jobs, filters=user_filter))

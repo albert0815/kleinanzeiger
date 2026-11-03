@@ -108,6 +108,7 @@ The bot will:
 ### Commands
 
 - `/start` or `/help` - Show welcome message
+- `/woche` - Show the lunches of the next seven days
 - `/neu` - Discard current draft and start fresh
 - `/inserate` - Show the ads on Kleinanzeigen; tap an ad for its actions
 - `/queue` - Check queue status (pending/backout jobs)
