@@ -137,6 +137,11 @@ changes made in the app survive. The run checks the new IDs online and reports t
 
 Run the tests with `python -m unittest test_ad_management`.
 
+## Recipes
+
+Send a link or describe a recipe in the chat. The bot shows a proposal and creates the
+recipe in Mahlino after you press the button. Links must lead to public addresses.
+
 ## Queue System
 
 The system uses a persistent queue for ad publishing:

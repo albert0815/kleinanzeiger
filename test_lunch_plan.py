@@ -160,6 +160,9 @@ class ToolAndBotTest(Base):
 
         self.main, self.tools = main, tools
         main.BOT = mock.AsyncMock()
+        users = mock.patch.object(main, "ALLOWED_USER_IDS", {1, 2})
+        users.start()
+        self.addCleanup(users.stop)
         import agent_registry
 
         self.tool_names = [t.tool_name for t in agent_registry._TOOLS]

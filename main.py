@@ -39,6 +39,7 @@ import ad_store
 import bot_runner
 import lunch_plan
 import mahlino
+import recipes
 from agent_registry import clear_agent, get_agent
 from background_worker import BackgroundWorker
 from queue_manager import QueueManager
@@ -595,6 +596,28 @@ async def announce_lunch_proposal() -> None:
             log.error("Failed to send lunch proposal to user %d: %s", user_id, e)
 
 
+async def announce_recipe_proposal(chat_id: int) -> None:
+    proposal = recipes.take_unannounced(chat_id)
+    if not proposal:
+        return
+    await BOT.send_message(
+        chat_id,
+        recipes.format_proposal(proposal["recipe"]),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Rezept speichern", callback_data=f"recipe_save:{proposal['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Verwerfen", callback_data=f"recipe_drop:{proposal['id']}"
+                    ),
+                ]
+            ]
+        ),
+    )
+
+
 async def _trigger_week_plan(
     user_id: int,
     context: ContextTypes.DEFAULT_TYPE,
@@ -668,7 +691,7 @@ async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     commands = "\n".join(f"/{c.command} — {c.description}" for c in BOT_COMMANDS)
     await update.message.reply_text(
-        "Hallo! Ich kann zwei Dinge:\n\n"
+        "Hallo! Das kann ich:\n\n"
         "📸 Kleinanzeigen-Inserate\n"
         "Schick mir ein Foto oder ein Album, dann erstelle ich einen Entwurf. "
         "Ich gleiche deine Inserate außerdem mit Kleinanzeigen ab, auch solche "
@@ -677,6 +700,9 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "🍽️ Mittagessen-Planung\n"
         "Jeden Morgen um 08:30 schicke ich dir den aktuellen Essensplan. Falls für "
         "die nächste Woche noch etwas fehlt, schlage ich einen Plan vor.\n\n"
+        "📖 Rezepte\n"
+        "Schick mir einen Link zu einem Rezept oder beschreib es, dann lege ich es "
+        "nach deiner Bestätigung in Mahlino an.\n\n"
         f"Befehle:\n{commands}"
     )
 
@@ -899,6 +925,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(chat_id, f"Fehler: {e}")
         return
     await announce_lunch_proposal()
+    await announce_recipe_proposal(chat_id)
 
     # If there is an active draft and the response is JSON, update it
     if d:
@@ -1266,6 +1293,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # ── Lunch plan confirmation ────────────────────────────────────────────
+    if q.data.startswith(("recipe_save:", "recipe_drop:")):
+        action, _, proposal_id = q.data.partition(":")
+        await q.edit_message_reply_markup(reply_markup=None)
+        if action == "recipe_drop":
+            recipes.discard_proposal(chat_id, proposal_id)
+            await context.bot.send_message(chat_id, "Rezept verworfen.")
+            return
+        try:
+            created = await asyncio.to_thread(recipes.save_proposal, chat_id, proposal_id)
+        except Exception as e:
+            log.exception("[chat=%d] saving recipe failed", chat_id)
+            await context.bot.send_message(
+                chat_id,
+                f"Fehler beim Speichern: {e}",
+                reply_markup=q.message.reply_markup if q.message else None,
+            )
+            return
+        await context.bot.send_message(
+            chat_id,
+            f"✅ Rezept gespeichert: {created['title']}"
+            if created
+            else "Dieses Rezept ist nicht mehr offen oder wurde schon bearbeitet.",
+        )
+        return
+
     if q.data.startswith("plan_accept:"):
         await q.edit_message_reply_markup(reply_markup=None)
         today = datetime.datetime.now(LUNCH_PLAN_TZ).date()
