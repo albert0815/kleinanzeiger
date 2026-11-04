@@ -211,7 +211,7 @@ class MainTest(Base):
         self.assertIn("Typ: Cityräder", edit.await_args.args[0])
         buttons = [b.text for row in edit.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
         self.assertIn("🚀 Direkt schalten", buttons)
-        self.assertNotIn("ermittelt", edit.await_args.args[0])
+        self.assertNotIn("Noch nicht fertig", edit.await_args.args[0])
         self.main.BOT.send_message.assert_not_awaited()
 
     def test_publish_button_only_when_fields_are_ready(self):
@@ -220,9 +220,10 @@ class MainTest(Base):
 
         d = self.draft()
         d.fields_state = "pending"
-        self.assertNotIn("🚀 Direkt schalten", labels(d))
-        self.assertIn("❌ Verwerfen", labels(d))
+        self.assertIsNone(self.main.ad_keyboard(d))
+        self.assertTrue(self.main.render_draft(d).startswith("⏳ *Noch nicht fertig*"))
         d.fields_state, d.missing_fields = "ready", [FIELDS[1]]
+        self.assertIn("❌ Verwerfen", labels(d))
         self.assertNotIn("🚀 Direkt schalten", labels(d))
         d.missing_fields = []
         self.assertIn("🚀 Direkt schalten", labels(d))
@@ -233,7 +234,7 @@ class MainTest(Base):
         d = self.draft()
         d.message_id = 7
         self.complete(d, "{}", fields=mock.AsyncMock(return_value=[FIELDS[0]]))
-        self.assertNotIn("ermittelt", self.main.BOT.edit_message_text.await_args.args[0])
+        self.assertNotIn("Noch nicht fertig", self.main.BOT.edit_message_text.await_args.args[0])
 
     def test_album_waits_for_slow_downloads(self):
         processed = []

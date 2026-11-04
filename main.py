@@ -213,15 +213,20 @@ def render_draft(d: Draft) -> str:
             label, shown = (f["label"], category_fields.option_label(f, value)) if f else (attribute, value)
             lines.append(f"• {escape_md(label)}: {escape_md(shown)}")
         details = "\n\n*Details:*\n" + "\n".join(lines)
-    if d.fields_state == "pending":
-        details += "\n\n_Pflichtfelder der Kategorie werden ermittelt …_"
     if d.missing_fields:
         lines = "\n".join(
             f"• {escape_md(_field_question(f['label'], category_fields.options_hint(f)))}"
             for f in d.missing_fields
         )
         details += f"\n\n*Pflichtfeld fehlt – bitte angeben:*\n{lines}"
+    pending = (
+        "⏳ *Noch nicht fertig* – ich ermittle die Felder der Kategorie. "
+        "Der Entwurf wird gleich ergänzt.\n\n"
+        if d.fields_state == "pending"
+        else ""
+    )
     return (
+        f"{pending}"
         f"*{escape_md(d.title)}*\n"
         f"_{escape_md(d.category)} · {escape_md(d.condition)}_\n\n"
         f"{escape_md(d.description)}\n\n"
@@ -245,7 +250,9 @@ def render_final(d: Draft) -> str:
     )
 
 
-def ad_keyboard(d: Draft) -> InlineKeyboardMarkup:
+def ad_keyboard(d: Draft) -> InlineKeyboardMarkup | None:
+    if d.fields_state == "pending":
+        return None  # not finished yet: no actions until the fields are known
     rows = [
         [
             InlineKeyboardButton("✅ Copy-Paste", callback_data="ok"),
@@ -254,7 +261,7 @@ def ad_keyboard(d: Draft) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❌ Verwerfen", callback_data="cancel")],
     ]
     # Publishing is offered only once the category's fields are known and filled.
-    if KLEINANZEIGEN_BOT_CMD and d.fields_state != "pending" and not d.missing_fields:
+    if KLEINANZEIGEN_BOT_CMD and not d.missing_fields:
         rows.insert(
             0, [InlineKeyboardButton("🚀 Direkt schalten", callback_data="publish")]
         )
