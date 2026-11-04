@@ -66,6 +66,42 @@ def classify_failure(output: str) -> str:
     return "other"
 
 
+_REASON_PATTERNS = (
+    re.compile(r"Form rejected for \[[^\]]*\]: (?:Ad form validation failed: )?(?P<reason>.+?)(?:\. Correct the ad configuration.*)?$", re.M),
+    re.compile(r"Category resolution failed for \[[^\]]*\]: (?P<reason>.+?)$", re.M),
+    re.compile(r"(?P<reason>Option '.+?' not found in button combobox '[^']+')", re.M),
+    re.compile(r"(?P<reason>Failed to set attribute '[^']+')", re.M),
+)
+_REASON_LABELS = {"Bitte gib einen Wert ein": "Pflichtfeld fehlt"}
+
+
+def failure_reasons(output: str) -> dict[str, str]:
+    """Reasons per ad title from a publish run, e.g. a rejected required field."""
+    text = _ANSI.sub("", output)
+    reasons: dict[str, str] = {}
+    for line in text.splitlines():
+        title = re.search(r"for \[([^\]]*)\]", line)
+        for pattern in _REASON_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                reason = match["reason"].strip().rstrip(".")
+                reason = re.sub(r"Offered choices: (.{120}).*", r"Offered choices: \1…", reason)
+                for raw, label in _REASON_LABELS.items():
+                    reason = reason.replace(raw, label)
+                reasons.setdefault(title[1] if title else "", reason)
+                break
+    return reasons
+
+
+def is_permanent_failure(output: str) -> bool:
+    """The site or the bot rejected the ad itself; retrying unchanged cannot help."""
+    text = _ANSI.sub("", output)
+    return any(marker in text for marker in (
+        "Form rejected for", "Category resolution failed", "not found in button combobox",
+        "Failed to set attribute", "Correct the ad configuration",
+    ))
+
+
 def parse_list_output(output: str) -> list[OnlineAd]:
     """Parse `kleinanzeigen-bot --lang=en list` output.
 
@@ -191,6 +227,66 @@ async def publish_ids(chat_id: int, ad_ids: list[str]) -> BotResult:
 async def download_ids(chat_id: int, ad_ids: list[str]) -> BotResult:
     """Fetch the online data into the separate downloaded-ads folder."""
     return await run_bot(chat_id, "download", f"--ads={','.join(ad_ids)}")
+
+
+FIELDS_PREFIX = "CATEGORY_FIELDS_JSON "
+
+
+async def category_fields(chat_id: int, category: str) -> list[dict]:
+    """Fields of a category via the patched `fields` command. Never submits."""
+    import json
+
+    result = await run_bot(chat_id, "fields", f"--category={category}", timeout=300)
+    line = next(
+        (l for l in _ANSI.sub("", result.output).splitlines() if l.startswith(FIELDS_PREFIX)), None
+    )
+    if result.returncode != 0 or line is None:
+        log.error("[chat=%d] fields failed (rc=%d):\n%s", chat_id, result.returncode, result.output)
+        reasons = failure_reasons(result.output)
+        raise BotFailure(
+            classify_failure(result.output),
+            next(iter(reasons.values()), "Die Felder der Kategorie konnten nicht gelesen werden."),
+        )
+    return json.loads(line[len(FIELDS_PREFIX):])["fields"]
+
+
+_FIELD_ERROR = re.compile(r"(?P<label>[^;:\[\]]+?) \[(?P<key>[\w.]+)\]: (?P<message>[^;]+)")
+_OPTION_ERROR = re.compile(
+    r"Option '(?P<value>.*?)' not found in button combobox '(?P<key>[\w.]+)'.*?\(observed: \[(?P<options>.*?)\]\)"
+)
+_UNKNOWN_FIELD = re.compile(r"Failed to set attribute '(?P<attribute>[^']+)'")
+
+
+def field_problems(output: str) -> list[dict]:
+    """Field problems from a failed publish, using the patched error messages.
+
+    Kinds: "missing" (key, label, message), "invalid" (key, value, options) and
+    "unknown" (attribute that this category does not have).
+    """
+    text = _ANSI.sub("", output)
+    problems: list[dict] = []
+    seen: set = set()
+
+    def add(problem: dict) -> None:
+        ident = (problem["kind"], problem.get("key") or problem.get("attribute"))
+        if ident not in seen:
+            seen.add(ident)
+            problems.append(problem)
+
+    for line in text.splitlines():
+        if "Form rejected for" in line:
+            details = line.split("validation failed: ", 1)[-1]
+            details = re.split(r"\.?\s*Correct the ad configuration", details)[0]
+            for match in _FIELD_ERROR.finditer(details):
+                add({"kind": "missing", "key": match["key"], "label": match["label"].strip(),
+                     "message": match["message"].strip().rstrip(".")})
+        for match in _OPTION_ERROR.finditer(line):
+            options = [o.strip().strip("'\"") for o in match["options"].split(",")]
+            add({"kind": "invalid", "key": match["key"], "value": match["value"],
+                 "options": [o for o in options if o and o != "Bitte wählen"]})
+        for match in _UNKNOWN_FIELD.finditer(line):
+            add({"kind": "unknown", "attribute": match["attribute"]})
+    return problems
 
 
 async def delete_online(chat_id: int, ad_id: str) -> BotResult:

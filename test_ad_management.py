@@ -346,6 +346,9 @@ class MainFlowTest(TempBase):
 
         self.main = main
         main.BOT = mock.AsyncMock()
+        users = mock.patch.object(main, "ALLOWED_USER_IDS", {CHAT})
+        users.start()
+        self.addCleanup(users.stop)
 
     def test_publish_touches_only_its_own_ad_and_requires_id(self):
         target = write_ad(self.base, "ziel")
@@ -374,10 +377,10 @@ class MainFlowTest(TempBase):
         target = write_ad(self.base, "ziel")
         result = bot_runner.BotResult(0, "DONE: (Re-)published 0 ads (1 failed after retries)")
         with mock.patch.object(bot_runner, "publish_new", mock.AsyncMock(return_value=result)):
-            ok, _ = asyncio.run(
+            outcome = asyncio.run(
                 self.main.handle_publish_job({"chat_id": CHAT, "ad_file": str(target)})
             )
-        self.assertFalse(ok)
+        self.assertFalse(outcome[0])
 
     def test_retry_after_success_does_not_publish_twice(self):
         target = write_ad(self.base, "ziel", ad_id=5)

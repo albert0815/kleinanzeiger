@@ -37,6 +37,7 @@ from telegram.helpers import escape_markdown
 
 import ad_store
 import bot_runner
+import category_fields
 import lunch_plan
 import mahlino
 import recipes
@@ -135,6 +136,13 @@ class Draft:
     price_eur: int = 0
     price_reasoning: str = ""
     missing_info: list[str] = field(default_factory=list)
+    # Category-specific form fields from the bot's `fields` command.
+    raw_attributes: dict = field(default_factory=dict)
+    attributes: dict[str, str] = field(default_factory=dict)  # special_attributes key -> stored value
+    missing_fields: list[dict] = field(default_factory=list)
+    fields: list[dict] | None = None
+    fields_category: str = ""
+    fields_state: str = "none"  # none | pending | ready | failed
 
 
 # Mutable per-chat state
@@ -142,6 +150,7 @@ DRAFTS: dict[int, Draft] = {}
 PENDING_ALBUMS: dict[tuple[int, str], dict] = {}
 CHAT_PHOTO_POOL: dict[int, list[bytes]] = {}
 ACTIVE_GENERATION_TASKS: dict[int, asyncio.Task] = {}
+AGENT_LOCKS: dict[int, asyncio.Lock] = {}
 
 BOT = None  # set in main(); job handlers have no callback context
 
@@ -172,6 +181,18 @@ def _apply_dict_to_draft(d: Draft, data: dict) -> None:
     d.price_eur = int(data.get("price_eur", d.price_eur) or 0)
     d.price_reasoning = str(data.get("price_reasoning", d.price_reasoning))
     d.missing_info = list(data.get("missing_info", d.missing_info) or [])
+    if isinstance(data.get("attributes"), dict):
+        d.raw_attributes = data["attributes"]
+    _validate_draft_fields(d)
+
+
+def _validate_draft_fields(d: Draft) -> None:
+    if d.fields is not None:
+        d.attributes, d.missing_fields = category_fields.validate(d.fields, d.raw_attributes)
+
+
+def _field_question(label: str, hint: str) -> str:
+    return f"{label}" + (f" (z. B. {hint})" if hint else "")
 
 
 def escape_md(s: str) -> str:
@@ -183,12 +204,29 @@ def render_draft(d: Draft) -> str:
     if d.missing_info:
         bullets = "\n".join(f"• {escape_md(m)}" for m in d.missing_info)
         missing = f"\n\n_Noch unklar:_\n{bullets}"
+    details = ""
+    if d.attributes:
+        lines = []
+        for attribute, value in d.attributes.items():
+            f = category_fields.find_field(d.fields or [], attribute)
+            label, shown = (f["label"], category_fields.option_label(f, value)) if f else (attribute, value)
+            lines.append(f"• {escape_md(label)}: {escape_md(shown)}")
+        details = "\n\n*Details:*\n" + "\n".join(lines)
+    if d.fields_state == "pending":
+        details += "\n\n_Pflichtfelder der Kategorie werden ermittelt …_"
+    if d.missing_fields:
+        lines = "\n".join(
+            f"• {escape_md(_field_question(f['label'], category_fields.options_hint(f)))}"
+            for f in d.missing_fields
+        )
+        details += f"\n\n*Pflichtfeld fehlt – bitte angeben:*\n{lines}"
     return (
         f"*{escape_md(d.title)}*\n"
         f"_{escape_md(d.category)} · {escape_md(d.condition)}_\n\n"
         f"{escape_md(d.description)}\n\n"
         f"*Preis:* {d.price_eur} EUR\n"
         f"_{escape_md(d.price_reasoning)}_"
+        f"{details}"
         f"{missing}"
     )
 
@@ -274,7 +312,9 @@ def write_ad_files(d: Draft, chat_id: int) -> Path:
     title = d.title.replace("\n", " ").strip()
     desc = d.description.strip()
     condition = CONDITION_VALUES.get(d.condition.strip().lower())
-    attributes = f"special_attributes:\n  condition_s: {condition}\n" if condition else ""
+    lines = [f"  condition_s: {condition}"] if condition else []
+    lines += [f"  {name}: {_yaml_escape(value)}" for name, value in d.attributes.items()]
+    attributes = "special_attributes:\n" + "\n".join(lines) + "\n" if lines else ""
     yaml_text = (
         "active: true\n"
         f"title: {_yaml_escape(title)}\n"
@@ -428,8 +468,10 @@ async def _call_agent(
     """
     agent = get_agent(chat_id)
     user_input = _build_agent_input(chat_id, message, photos)
-    set_agent_chat_id(chat_id)
-    result = await asyncio.to_thread(agent, user_input)
+    # One turn at a time per chat: field completion may run alongside a message.
+    async with AGENT_LOCKS.setdefault(chat_id, asyncio.Lock()):
+        set_agent_chat_id(chat_id)
+        result = await asyncio.to_thread(agent, user_input)
     return str(result)
 
 
@@ -494,28 +536,31 @@ async def _call_agent_streaming(
     last_edit_at = 0.0
     last_edit_len = 0
 
-    try:
-        async for event in stream_async(_build_agent_input(chat_id, message)):
-            if "data" in event:
-                chunk = str(event["data"])
-                chunks.append(chunk)
-                current_len += len(chunk)
-                current_text = "".join(chunks)
-                if not current_text:
-                    continue
-                now = time.monotonic()
-                if (
-                    now - last_edit_at >= STREAM_EDIT_INTERVAL_SECONDS
-                    or current_len - last_edit_len >= STREAM_EDIT_MIN_CHARS
-                ):
-                    await _edit_stream_message(stream_message, current_text)
-                    last_edit_at = now
-                    last_edit_len = current_len
-            elif "result" in event:
-                final_text = str(event["result"]).strip()
-    except Exception:
-        await _edit_stream_message(stream_message, "⚠️ Fehler beim Generieren.")
-        raise
+    async with AGENT_LOCKS.setdefault(chat_id, asyncio.Lock()):
+        set_agent_chat_id(chat_id)
+        try:
+            async for event in stream_async(_build_agent_input(chat_id, message)):
+                if "data" in event:
+                    chunk = str(event["data"])
+                    chunks.append(chunk)
+                    current_len += len(chunk)
+                    current_text = "".join(chunks)
+                    if not current_text:
+                        continue
+                    now = time.monotonic()
+                    if (
+                        now - last_edit_at >= STREAM_EDIT_INTERVAL_SECONDS
+                        or current_len - last_edit_len >= STREAM_EDIT_MIN_CHARS
+                    ):
+                        await _edit_stream_message(stream_message, current_text)
+                        last_edit_at = now
+                        last_edit_len = current_len
+                elif "result" in event:
+                    final_text = str(event["result"]).strip()
+        except Exception:
+            await _edit_stream_message(stream_message, "⚠️ Fehler beim Generieren.")
+            raise
+
 
     response = final_text or "".join(chunks).strip()
     await _edit_stream_message(
@@ -915,6 +960,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     d = DRAFTS.get(chat_id)
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    if not d:
+        try:
+            if await answer_publish_question(chat_id, user_request):
+                return
+        except Exception:
+            log.exception("[chat=%d] handling the answer failed", chat_id)
     try:
         if d:
             response = await _call_agent(chat_id, user_request)
@@ -931,7 +982,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if d:
         parsed = _parse_json_from_response(response)
         if parsed and "title" in parsed:
+            category_before = d.fields_category
             _apply_dict_to_draft(d, parsed)
+            if d.fields is not None and d.category != category_before:
+                # A different category has different fields.
+                d.fields, d.raw_attributes, d.attributes, d.missing_fields = None, {}, {}, []
+                start_field_completion(chat_id, d)
             await context.bot.send_message(
                 chat_id,
                 render_draft(d),
@@ -1065,6 +1121,7 @@ async def _process_photos(
         d.title,
         d.price_eur,
     )
+    start_field_completion(chat_id, d)
     await context.bot.send_message(
         chat_id,
         render_draft(d),
@@ -1073,7 +1130,195 @@ async def _process_photos(
     )
 
 
-async def handle_publish_job(job_data: dict) -> tuple[bool, str]:
+async def complete_draft_fields(chat_id: int, d: Draft) -> None:
+    """Get the category's fields via the bot and let the agent fill them in."""
+    category = ad_store.resolve_category(d.category)
+    if not category or not KLEINANZEIGEN_BOT_CMD:
+        d.fields_state = "none"
+        return
+    d.fields_state = "pending"
+    fields = category_fields.cached(category)
+    if fields is None:
+        try:
+            fields = await bot_runner.category_fields(chat_id, category)
+        except BotFailure as e:
+            log.error("[chat=%d] reading fields for %s failed: %s", chat_id, category, e)
+            if DRAFTS.get(chat_id) is d:
+                d.fields_state = "failed"
+                await BOT.send_message(
+                    chat_id,
+                    f"⚠️ Die Felder der Kategorie konnten nicht gelesen werden: {e}\n"
+                    "Du kannst trotzdem schalten. Fehlt etwas, frage ich dann nach.",
+                )
+            return
+        category_fields.store(category, fields)
+    if DRAFTS.get(chat_id) is not d:
+        return
+    d.fields, d.fields_category = fields, d.category
+    todo = category_fields.describe_for_agent(fields)
+    if todo:
+        prompt = (
+            f"Die Kategorie «{category}» hat diese Zusatzfelder: "
+            f"{json.dumps(todo, ensure_ascii=False)}\n"
+            "Gib das vollständige Inserat-JSON zurück und ergänze \"attributes\" als Objekt "
+            "{Feldname: exakter Optionstext}. Pflichtfelder (required=true) füllst du, wenn Fotos "
+            "oder Angaben es hergeben, sonst lässt du sie weg. Optionale Felder nur, wenn sie "
+            "eindeutig erkennbar sind. Ändere sonst nichts."
+        )
+        try:
+            parsed = _parse_json_from_response(await _call_agent(chat_id, prompt))
+        except Exception:
+            log.exception("[chat=%d] filling fields failed", chat_id)
+            parsed = None
+        if DRAFTS.get(chat_id) is not d:
+            return
+        if parsed and "title" in parsed:
+            _apply_dict_to_draft(d, parsed)
+    _validate_draft_fields(d)
+    d.fields_state = "ready"
+    if todo:
+        await BOT.send_message(
+            chat_id, render_draft(d), parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard()
+        )
+
+
+def start_field_completion(chat_id: int, d: Draft) -> asyncio.Task:
+    if KLEINANZEIGEN_BOT_CMD and ad_store.resolve_category(d.category):
+        d.fields_state = "pending"
+    task = asyncio.create_task(complete_draft_fields(chat_id, d))
+    task.add_done_callback(
+        lambda t: t.cancelled() or not t.exception()
+        or log.error("[chat=%d] field completion crashed: %r", chat_id, t.exception())
+    )
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Questions after a rejected publish: ask the user, then publish again
+# ---------------------------------------------------------------------------
+
+
+def _questions_path() -> Path:
+    return ad_store.base_dir() / ".publish-questions.json"
+
+
+def _load_questions() -> dict:
+    try:
+        return json.loads(_questions_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_questions(data: dict) -> None:
+    temporary = _questions_path().with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    temporary.replace(_questions_path())
+
+
+def _attribute_for_key(key: str) -> str:
+    return f"{key.rsplit('.', 1)[-1]}_s"
+
+
+def _questions_from_problems(problems: list[dict], category: str | None) -> list[dict]:
+    """One question per field: label, special_attributes key and known options."""
+    fields = category_fields.cached(category) if category else None
+    questions = []
+    for problem in problems:
+        if problem["kind"] == "unknown":
+            continue
+        attribute = _attribute_for_key(problem["key"])
+        known = category_fields.find_field(fields or [], problem["key"])
+        options = [o["label"] for o in known["options"]] if known else []
+        if problem["kind"] == "invalid":
+            options = problem["options"] or options
+        label = problem.get("label") or (known["label"] if known else problem["key"])
+        questions.append({"attribute": attribute, "label": label, "options": options,
+                          "rejected": problem.get("value")})
+    return questions
+
+
+def _edit_special_attributes(ad_file: Path, set_values: dict[str, str], remove: list[str]) -> None:
+    data = yaml.safe_load(ad_file.read_text(encoding="utf-8")) or {}
+    attributes = dict(data.get("special_attributes") or {})
+    for name in remove:
+        attributes.pop(name, None)
+    attributes.update(set_values)
+    data["special_attributes"] = attributes or None
+    ad_file.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def _enqueue_publish(chat_id: int, ad_file: Path) -> str:
+    job_id = str(uuid.uuid4())
+    QUEUE_MANAGER.enqueue(
+        job_id=job_id, chat_id=chat_id, job_type="publish_ad",
+        data={"ad_file": str(ad_file), "chat_id": chat_id},
+    )
+    return job_id
+
+
+def _question_text(title: str, questions: list[dict]) -> str:
+    lines = []
+    for q in questions:
+        hint = ", ".join(q["options"][:8]) + (" …" if len(q["options"]) > 8 else "")
+        rejected = f" – «{q['rejected']}» gibt es nicht" if q.get("rejected") else ""
+        lines.append(f"• {q['label']}{rejected}" + (f"\n  Möglich: {hint}" if hint else ""))
+    return (
+        f"Kleinanzeigen braucht für «{title}» noch:\n" + "\n".join(lines)
+        + "\n\nSchreib mir die Werte, dann schalte ich erneut."
+    )
+
+
+async def answer_publish_question(chat_id: int, text: str) -> bool:
+    """Use the user's reply to an open question. Returns False if it was not an answer."""
+    entry = _load_questions().get(str(chat_id))
+    if not entry:
+        return False
+    prompt = (
+        f"Offene Rückfrage zum Inserat «{entry['title']}»: "
+        f"{json.dumps([{'field': q['label'], 'options': q['options'] or 'Freitext'} for q in entry['questions']], ensure_ascii=False)}\n"
+        f"Antwort des Nutzers: {json.dumps(text, ensure_ascii=False)}\n"
+        "Antworte NUR mit JSON {\"answers\": {Feldname: Wert}}. Werte mit Optionen müssen exakt "
+        "einer Option entsprechen. Enthält die Antwort nichts dazu, antworte {\"answers\": {}}."
+    )
+    parsed = _parse_json_from_response(await _call_agent(chat_id, prompt)) or {}
+    answers = parsed.get("answers") if isinstance(parsed.get("answers"), dict) else {}
+    if not answers:
+        return False
+    chosen, still_open = {}, []
+    for q in entry["questions"]:
+        value = next((v for k, v in answers.items() if str(k).casefold() == q["label"].casefold()), None)
+        if value and q["options"]:
+            value = next((o for o in q["options"] if o.casefold() == str(value).strip().casefold()), None)
+        if value:
+            chosen[q["attribute"]] = str(value).strip()
+        else:
+            still_open.append(q)
+    if still_open:
+        if chosen:
+            entry["questions"] = still_open
+            entry.setdefault("answers", {}).update(chosen)
+            data = _load_questions()
+            data[str(chat_id)] = entry
+            _save_questions(data)
+        await BOT.send_message(chat_id, _question_text(entry["title"], still_open))
+        return True
+    chosen = {**entry.get("answers", {}), **chosen}
+    ad_file = Path(entry["ad_file"])
+    try:
+        _edit_special_attributes(ad_file, chosen, [])
+    except (OSError, yaml.YAMLError) as e:
+        await BOT.send_message(chat_id, f"Fehler beim Speichern der Angaben: {e}")
+        return True
+    data = _load_questions()
+    data.pop(str(chat_id), None)
+    _save_questions(data)
+    job_id = _enqueue_publish(chat_id, ad_file)
+    summary = ", ".join(f"{q['label']}: {chosen[q['attribute']]}" for q in entry["questions"] if q["attribute"] in chosen)
+    await BOT.send_message(chat_id, f"Danke. Ich schalte «{entry['title']}» erneut ({summary}). Job {job_id[:8]}")
+    return True
+
+
+async def handle_publish_job(job_data: dict) -> tuple:
     """Publish exactly the ad of this job and confirm it received an ID."""
     chat_id = job_data["chat_id"]
     ad_file = Path(job_data.get("ad_file", ""))
@@ -1104,12 +1349,45 @@ async def handle_publish_job(job_data: dict) -> tuple[bool, str]:
         await sync_account(chat_id)
         return True, f"✅ Anzeige geschaltet: {ad.title} (ID {ad.ad_id})"
     log.error("[chat=%d] publish failed (rc=%d):\n%s", chat_id, result.returncode, result.output)
+    title = ad.title if ad else ad_file.parent.name
+    category = _ad_category(ad_file)
+    problems = bot_runner.field_problems(result.output)
+    if problems:
+        unknown = [p["attribute"] for p in problems if p["kind"] == "unknown"]
+        questions = _questions_from_problems(problems, category)
+        if category and "Form rejected" in result.output:
+            category_fields.invalidate(category)  # the form may have changed
+        if unknown:
+            _edit_special_attributes(ad_file, {}, unknown)
+        if not questions:
+            # Only fields the category does not have: drop them and try once more.
+            _enqueue_publish(chat_id, ad_file)
+            return False, f"«{title}»: {', '.join(unknown)} gibt es in dieser Kategorie nicht. Ich habe es entfernt und schalte erneut.", True
+        data = _load_questions()
+        data[str(chat_id)] = {"ad_file": str(ad_file), "title": title, "questions": questions}
+        _save_questions(data)
+        return False, _question_text(title, questions), True
+    reasons = bot_runner.failure_reasons(result.output)
+    reason = reasons.get(title) or next(iter(reasons.values()), None)
     if "condition_s" in result.output:
         # Next attempt without the attribute this category does not accept.
         _strip_condition(ad_file)
-    kind = bot_runner.classify_failure(result.output)
-    hint = FAILURE_HINTS.get(kind, "Details stehen im Log.")
-    return False, f"Das Schalten ist fehlgeschlagen: {hint}"
+        return False, f"«{title}»: Zustand wird nicht akzeptiert. Ich versuche es ohne Zustand erneut."
+    if not reason:
+        reason = FAILURE_HINTS.get(bot_runner.classify_failure(result.output), "Details stehen im Log.")
+    return (
+        False,
+        f"Das Schalten von «{title}» ist fehlgeschlagen: {reason}",
+        bot_runner.is_permanent_failure(result.output),
+    )
+
+
+def _ad_category(ad_file: Path) -> str | None:
+    try:
+        value = yaml.safe_load(ad_file.read_text(encoding="utf-8")).get("category")
+    except (OSError, AttributeError, yaml.YAMLError):
+        return None
+    return str(value) if value else None
 
 
 async def handle_delete_job(job_data: dict) -> tuple[bool, str]:
@@ -1194,11 +1472,13 @@ async def handle_republish_job(job_data: dict) -> tuple[bool, str]:
         return False, f"Neu schalten unterbrochen: {_describe_failure(e)}"
 
     online_ids = {o.ad_id for o in online}
+    reasons = bot_runner.failure_reasons(result.output) if ready else {}
     for ad in ready:
         current = ad_store.load_ad_file(chat_id, ad.path)
         new_id = current.ad_id if current else None
         if not new_id or new_id == ad.ad_id:
-            lines.append(f"❌ Nicht neu geschaltet: {ad.title}")
+            reason = reasons.get(ad.title)
+            lines.append(f"❌ Nicht neu geschaltet: {ad.title}" + (f" – {reason}" if reason else ""))
         elif new_id not in online_ids:
             lines.append(f"⚠️ Neue Anzeige online nicht gefunden: {ad.title}")
         elif ad.ad_id in online_ids:
@@ -1389,6 +1669,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id,
                 "Direktes Schalten ist nicht konfiguriert (KLEINANZEIGEN_BOT_CMD fehlt).",
+            )
+            return
+        if d.fields_state == "pending":
+            await context.bot.send_message(
+                chat_id, "Einen Moment, ich ermittle noch die Pflichtfelder der Kategorie."
+            )
+            return
+        if d.missing_fields:
+            lines = "\n".join(
+                f"• {_field_question(f['label'], category_fields.options_hint(f))}" for f in d.missing_fields
+            )
+            await context.bot.send_message(
+                chat_id, f"Bevor ich schalte, brauche ich noch:\n{lines}\n\nSchreib mir einfach die Werte."
             )
             return
         await q.edit_message_reply_markup(reply_markup=None)

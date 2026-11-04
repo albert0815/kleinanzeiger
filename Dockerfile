@@ -26,6 +26,10 @@ COPY scripts/patch_nodriver_connect_timeout.py /opt/patch_nodriver_connect_timeo
 # Reads the labels of the redesigned category dialog; see the script for why.
 COPY scripts/patch_category_dialog_labels.py /opt/patch_category_dialog_labels.py
 COPY scripts/test_category_dialog_patch.py /opt/test_category_dialog_patch.py
+# Adds a `fields` command and names fields in form errors; see the script.
+COPY scripts/patch_category_fields_command.py /opt/patch_category_fields_command.py
+COPY bot-patches/ /opt/bot-patches/
+COPY scripts/test_fields_command.py /opt/test_fields_command.py
 
 WORKDIR /opt/kleinanzeigen-bot-src
 # `pdm install` runs kleinanzeigen-bot's own post_install hook
@@ -33,8 +37,9 @@ WORKDIR /opt/kleinanzeigen-bot-src
 RUN pdm install -v \
     && pdm run python /opt/patch_nodriver_connect_timeout.py \
     && python /opt/patch_category_dialog_labels.py \
-    && cp /opt/test_category_dialog_patch.py tests/unit/ \
-    && pdm run pytest -q -p no:cacheprovider --no-cov tests/unit/test_category_dialog_patch.py \
+    && python /opt/patch_category_fields_command.py /opt/bot-patches \
+    && cp /opt/test_category_dialog_patch.py /opt/test_fields_command.py tests/unit/ \
+    && pdm run pytest -q -p no:cacheprovider --no-cov tests/unit/test_category_dialog_patch.py tests/unit/test_fields_command.py \
     && pdm run compile \
     && ./dist/kleinanzeigen-bot --help
 
@@ -71,7 +76,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 # Copy application source
-COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ad_store.py bot_runner.py lunch_plan.py recipes.py ./
+COPY --chown=appuser main.py mahlino.py background_worker.py queue_manager.py agent_registry.py tools.py skills.py ad_store.py bot_runner.py lunch_plan.py recipes.py category_fields.py ./
 COPY --chown=appuser skills/ ./skills/
 
 USER appuser

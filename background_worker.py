@@ -18,7 +18,7 @@ class BackgroundWorker:
     def __init__(
         self,
         queue_manager: QueueManager,
-        job_handlers: dict[str, Callable[[dict], Awaitable[tuple[bool, str]]]],
+        job_handlers: dict[str, Callable[[dict], Awaitable[tuple]]],
         on_job_completed: Callable[[str, int, bool, str], Awaitable[None]] | None = None,
     ):
         """
@@ -27,7 +27,7 @@ class BackgroundWorker:
         Args:
             queue_manager: The QueueManager instance
             job_handlers: Dict mapping job_type -> async handler function.
-                         Handler should return (success, message).
+                         Handler should return (success, message[, permanent]).
             on_job_completed: Optional async callback called when job completes.
                             Signature: async def(job_id: str, chat_id: int, success: bool, message: str)
         """
@@ -85,14 +85,17 @@ class BackgroundWorker:
 
                 # Execute the handler
                 try:
-                    success, message = await handler(job.data)
+                    outcome = await handler(job.data)
+                    # Handlers may add a third value: True if retrying cannot help.
+                    success, message = outcome[0], outcome[1]
+                    permanent = len(outcome) > 2 and outcome[2]
                     if success:
                         self.queue_manager.mark_completed(job.job_id)
                         log.info("[job=%s] Completed: %s", job.job_id, message)
                         if self.on_job_completed:
                             await self.on_job_completed(job.job_id, job.chat_id, True, message)
                     else:
-                        self.queue_manager.mark_failed(job.job_id, message)
+                        self.queue_manager.mark_failed(job.job_id, message, is_backout=permanent)
                         log.warning("[job=%s] Failed: %s", job.job_id, message)
                         # Only notify on failure when the job is moved to backout (all retries exhausted)
                         if job.job_id in self.queue_manager.backout:
