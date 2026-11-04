@@ -265,6 +265,43 @@ def _clean_price(value) -> int | None:
     return price
 
 
+def _now() -> str:
+    return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+
+
+def _clean_query(query: str | None) -> str:
+    query = " ".join((query or "").split())
+    if not query:
+        raise WatchError("Der Suchbegriff fehlt.")
+    if len(query) > 100:
+        raise WatchError("Der Suchbegriff ist zu lang.")
+    return query
+
+
+def _check_prices(watch: dict) -> None:
+    if (
+        watch["min_price"] is not None
+        and watch["max_price"] is not None
+        and watch["min_price"] > watch["max_price"]
+    ):
+        raise WatchError("Der Mindestpreis liegt über dem Höchstpreis.")
+
+
+def _set_location(watch: dict, location: str, radius_km: int | None) -> None:
+    watch["location_id"], watch["location_name"] = resolve_location(location)
+    watch["radius_km"] = nearest_radius(radius_km or watch.get("radius_km") or 30)
+
+
+def _remember_current(watch: dict) -> list[Hit]:
+    """Read the first page and treat it as known, so only later results are reported."""
+    hits, _ = fetch_results(watch)
+    watch["seen"] = [h.id for h in hits]
+    watch["checked_at"] = _now()
+    watch["failures"] = 0
+    watch["failure_notified"] = False
+    return hits
+
+
 def create_watch(
     chat_id: int,
     query: str,
@@ -272,53 +309,103 @@ def create_watch(
     radius_km: int | None = None,
     min_price: int | None = None,
     max_price: int | None = None,
-) -> tuple[dict, int]:
-    """Create a watch and remember its current results. Returns (watch, result count)."""
-    query = " ".join((query or "").split())
-    if not query:
-        raise WatchError("Der Suchbegriff fehlt.")
-    if len(query) > 100:
-        raise WatchError("Der Suchbegriff ist zu lang.")
+) -> tuple[dict, list[Hit]]:
+    """Create a watch and remember its current results. Returns (watch, current hits)."""
     watch = {
         "id": uuid.uuid4().hex[:8],
-        "query": query,
+        "query": _clean_query(query),
         "location_id": None,
         "location_name": None,
         "radius_km": None,
         "min_price": _clean_price(min_price),
         "max_price": _clean_price(max_price),
-        "created_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "created_at": _now(),
         "checked_at": None,
         "failures": 0,
         "failure_notified": False,
         "seen": [],
     }
-    if (
-        watch["min_price"] is not None
-        and watch["max_price"] is not None
-        and watch["min_price"] > watch["max_price"]
-    ):
-        raise WatchError("Der Mindestpreis liegt über dem Höchstpreis.")
-    location = (location or "").strip()
-    if location:
-        watch["location_id"], watch["location_name"] = resolve_location(location)
-        watch["radius_km"] = nearest_radius(radius_km if radius_km else 30)
-
+    _check_prices(watch)
     with _lock:
-        watches = _load(chat_id)
-        if len(watches) >= MAX_WATCHES_PER_CHAT:
+        if len(_load(chat_id)) >= MAX_WATCHES_PER_CHAT:
             raise WatchError(
                 f"Du hast schon {MAX_WATCHES_PER_CHAT} Suchaufträge. Lösche zuerst einen."
             )
-    hits, _ = fetch_results(watch)
-    watch["seen"] = [h.id for h in hits]
-    watch["checked_at"] = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    location = (location or "").strip()
+    if location:
+        _set_location(watch, location, radius_km)
+    hits = _remember_current(watch)
     with _lock:
         watches = _load(chat_id)
         watches.append(watch)
         _save(chat_id, watches)
     log.info("[chat=%d] search watch %s created: %s", chat_id, watch["id"], describe(watch))
-    return watch, len(hits)
+    return watch, hits
+
+
+def update_watch(
+    chat_id: int,
+    watch_id: str,
+    query: str | None = None,
+    location: str | None = None,
+    radius_km: int | None = None,
+    nationwide: bool = False,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    remove_price_limits: bool = False,
+) -> tuple[dict, list[Hit]]:
+    """Change a watch. Arguments left at None stay as they are.
+
+    The search is different afterwards, so its current results are read again and
+    count as known. Returns (watch, current hits).
+    """
+    watch = next((w for w in list_watches(chat_id) if w["id"] == watch_id), None)
+    if not watch:
+        raise WatchError(f"Es gibt keinen Suchauftrag mit der ID {watch_id}.")
+    location = (location or "").strip()
+    if nationwide and (location or radius_km):
+        raise WatchError("Deutschlandweit und ein Ort schließen sich aus.")
+    if query is not None:
+        watch["query"] = _clean_query(query)
+    if remove_price_limits:
+        watch["min_price"] = watch["max_price"] = None
+    if min_price is not None:
+        watch["min_price"] = _clean_price(min_price)
+    if max_price is not None:
+        watch["max_price"] = _clean_price(max_price)
+    _check_prices(watch)
+    if nationwide:
+        watch["location_id"] = watch["location_name"] = watch["radius_km"] = None
+    elif location:
+        _set_location(watch, location, radius_km)
+    elif radius_km:
+        if not watch.get("location_id"):
+            raise WatchError("Für einen Umkreis brauche ich einen Ort oder eine Postleitzahl.")
+        watch["radius_km"] = nearest_radius(radius_km)
+    hits = _remember_current(watch)
+    with _lock:
+        watches = _load(chat_id)
+        index = next((i for i, w in enumerate(watches) if w["id"] == watch_id), None)
+        if index is None:
+            raise WatchError("Der Suchauftrag wurde inzwischen gelöscht.")
+        watches[index] = watch
+        _save(chat_id, watches)
+    log.info("[chat=%d] search watch %s changed: %s", chat_id, watch_id, describe(watch))
+    return watch, hits
+
+
+# Overviews of created or changed watches, shown by the bot after the agent's reply.
+_overviews: dict[int, dict[str, tuple[dict, list[Hit]]]] = {}
+
+
+def store_overview(chat_id: int, watch: dict, hits: list[Hit]) -> None:
+    with _lock:
+        _overviews.setdefault(chat_id, {})[watch["id"]] = (watch, hits)
+
+
+def pop_overviews(chat_id: int) -> list[tuple[dict, list[Hit]]]:
+    with _lock:
+        return list(_overviews.pop(chat_id, {}).values())
 
 
 def delete_watch(chat_id: int, watch_id: str) -> dict | None:

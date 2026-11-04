@@ -153,6 +153,9 @@ Ask in the chat, e.g. „Sag mir Bescheid, wenn jemand ein Lego Technic 42056 im
 30 km um 80331 anbietet“ or „Such deutschlandweit nach Rennrad Shimano 105 bis 400 €“. The agent
 creates a watch with search words, optional postcode or place with radius (5–200 km; without a
 place the search covers all of Germany) and optional price limits.
+Right after creating or changing a watch, the bot shows the 10 newest current results and a link
+to all of them. Watches can be changed in the chat, e.g. „Nein, nicht deutschlandweit, um
+Gerolsbach“, „lieber 50 km“ or „ohne Preisgrenze“; the bot then reads the current results again.
 
 Once a day, at a random time between 20:00 and 21:00, the bot reads the results of each watch,
 sorted by date, with plain HTTP requests; no browser and no login. It reads page after page until

@@ -397,19 +397,68 @@ def create_search_watch(
     chat_id = _chat_id_ctx.get()
     if chat_id is None:
         return "Fehler: Kein Nutzerkontext verfügbar."
-    try:
-        watch, count = search_watch.create_watch(
+    return _watch_change(
+        "angelegt",
+        chat_id,
+        lambda: search_watch.create_watch(
             chat_id, query, location, radius_km, min_price, max_price
-        )
+        ),
+    )
+
+
+def _watch_change(done: str, chat_id: int, change) -> str:
+    try:
+        watch, hits = change()
     except search_watch.WatchError as e:
         return f"Fehler: {e}"
     except (httpx.HTTPError, ValueError) as e:
-        log.warning("[chat=%d] creating search watch failed: %s", chat_id, e)
+        log.warning("[chat=%d] search watch change failed: %s", chat_id, e)
         return "Fehler: Kleinanzeigen war gerade nicht erreichbar. Versuche es später erneut."
+    search_watch.store_overview(chat_id, watch, hits)
     return (
-        f"Suchauftrag {watch['id']} angelegt: {search_watch.describe(watch)}. "
-        f"Aktuell gibt es {count} Treffer auf der ersten Seite; die gelten als bekannt. "
-        "Gemeldet werden nur neue Treffer."
+        f"Suchauftrag {watch['id']} {done}: {search_watch.describe(watch)}. "
+        f"Aktuell {len(hits)} Treffer auf der ersten Seite. Der Bot zeigt sie gleich mit Link "
+        "an; zähle sie nicht auf. Ab jetzt meldet er jeden Abend zwischen 20 und 21 Uhr "
+        "nur neue Treffer."
+    )
+
+
+@tool
+def update_search_watch(
+    watch_id: str,
+    query: str | None = None,
+    location: str | None = None,
+    radius_km: int | None = None,
+    nationwide: bool = False,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    remove_price_limits: bool = False,
+) -> str:
+    """Change an existing search watch. Only pass what should change.
+
+    Use this when the user corrects or adjusts a watch, also right after creating
+    it ("nein, nicht deutschlandweit, um Gerolsbach"). Do not create a second one.
+
+    Args:
+        watch_id: the id from create_search_watch or list_search_watches
+        query: new search words
+        location: new postcode or place; switches to a radius search
+        radius_km: new radius (5, 10, 20, 30, 50, 100, 150 or 200)
+        nationwide: true to search all of Germany instead of a radius
+        min_price: new lowest price in EUR
+        max_price: new highest price in EUR
+        remove_price_limits: true to drop both price limits (new ones given here still apply)
+    """
+    chat_id = _chat_id_ctx.get()
+    if chat_id is None:
+        return "Fehler: Kein Nutzerkontext verfügbar."
+    return _watch_change(
+        "geändert",
+        chat_id,
+        lambda: search_watch.update_watch(
+            chat_id, watch_id, query, location, radius_km, nationwide,
+            min_price, max_price, remove_price_limits,
+        ),
     )
 
 

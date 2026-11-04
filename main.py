@@ -95,6 +95,7 @@ SEARCH_WATCH_MAX_JITTER_SECONDS = 55 * 60
 SEARCH_WATCH_PAUSE_SECONDS = (2.0, 6.0)
 # Leaves room for the closing line within Telegram's message limit.
 SEARCH_WATCH_TEXT_BUDGET = 3600
+SEARCH_WATCH_OVERVIEW_HITS = 10
 
 
 def _user_work_dir(chat_id: int) -> Path:
@@ -764,32 +765,75 @@ def _watch_delete_button(watch: dict) -> InlineKeyboardButton:
     )
 
 
+def _hit_entries(hits: list[search_watch.Hit], budget: int, limit: int | None = None) -> list[str]:
+    """HTML entries for hits, newest first, as many as fit into *budget* characters."""
+    entries: list[str] = []
+    length = 0
+    for hit in hits[:limit]:
+        details = " · ".join(p for p in (hit.price, hit.location, hit.date) if p)
+        entry = f"<a href=\"{html.escape(hit.url)}\">{html.escape(hit.title or 'Anzeige')}</a>" + (
+            f"\n{html.escape(details)}" if details else ""
+        )
+        if length + len(entry) + 2 > budget:
+            break
+        entries.append(entry)
+        length += len(entry) + 2
+    return entries
+
+
+def _all_hits_link(watch: dict) -> str:
+    return f"<a href=\"{html.escape(search_watch.search_url(watch))}\">Alle Treffer ansehen</a>"
+
+
 def format_watch_hits(
     watch: dict, hits: list[search_watch.Hit], complete: bool = True
 ) -> str:
     """HTML message listing new hits of a watch, newest first, within Telegram's limit."""
     count = f"{len(hits)}" if complete else f"Mehr als {len(hits)}"
-    lines = [
-        f"🔔 {count} neu bei Kleinanzeigen für {html.escape(search_watch.describe(watch))}:"
-    ]
-    length = len(lines[0])
-    listed = 0
-    for hit in hits:
-        details = " · ".join(p for p in (hit.price, hit.location, hit.date) if p)
-        entry = f"\n<a href=\"{html.escape(hit.url)}\">{html.escape(hit.title or 'Anzeige')}</a>" + (
-            f"\n{html.escape(details)}" if details else ""
-        )
-        if length + len(entry) > SEARCH_WATCH_TEXT_BUDGET:
-            break
-        lines.append(entry)
-        length += len(entry) + 1
-        listed += 1
-    if listed < len(hits) or not complete:
+    header = f"🔔 {count} neu bei Kleinanzeigen für {html.escape(search_watch.describe(watch))}:"
+    entries = _hit_entries(hits, SEARCH_WATCH_TEXT_BUDGET - len(header))
+    lines = [header, *entries]
+    if len(entries) < len(hits) or not complete:
         rest = "weitere" if complete else "noch mehr"
-        others = f"… und {len(hits) - listed} {rest}" if listed < len(hits) else f"… und {rest}"
-        url = html.escape(search_watch.search_url(watch))
-        lines.append(f"\n{others}. <a href=\"{url}\">Alle Treffer ansehen</a>")
-    return "\n".join(lines)
+        others = (
+            f"… und {len(hits) - len(entries)} {rest}"
+            if len(entries) < len(hits)
+            else f"… und {rest}"
+        )
+        lines.append(f"{others}. {_all_hits_link(watch)}")
+    return "\n\n".join(lines)
+
+
+def format_watch_overview(watch: dict, hits: list[search_watch.Hit]) -> str:
+    """HTML message after creating or changing a watch: what is there right now."""
+    lines = [f"🔎 Suchauftrag {html.escape(search_watch.describe(watch))}"]
+    if hits:
+        lines.append("Aktuell auf Kleinanzeigen, neueste zuerst:")
+        entries = _hit_entries(hits, SEARCH_WATCH_TEXT_BUDGET, SEARCH_WATCH_OVERVIEW_HITS)
+        lines.extend(entries)
+        if len(entries) < len(hits):
+            lines.append(f"… {_all_hits_link(watch)}")
+        else:
+            lines.append(_all_hits_link(watch))
+    else:
+        lines.append(f"Aktuell gibt es keine Treffer. {_all_hits_link(watch)}")
+    lines.append("Ab jetzt melde ich jeden Abend zwischen 20 und 21 Uhr nur neue Treffer.")
+    return "\n\n".join(lines)
+
+
+async def announce_watch_overviews(chat_id: int) -> None:
+    """Show the watches the agent just created or changed, if they still exist."""
+    existing = {w["id"] for w in search_watch.list_watches(chat_id)}
+    for watch, hits in search_watch.pop_overviews(chat_id):
+        if watch["id"] not in existing:
+            continue
+        await BOT.send_message(
+            chat_id,
+            format_watch_overview(watch, hits),
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=InlineKeyboardMarkup([[_watch_delete_button(watch)]]),
+        )
 
 
 async def _report_watch_result(chat_id: int, result: search_watch.CheckResult) -> None:
@@ -1094,6 +1138,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await announce_lunch_proposal()
     await announce_recipe_proposal(chat_id)
+    try:
+        await announce_watch_overviews(chat_id)
+    except Exception:
+        log.exception("[chat=%d] showing search watch overview failed", chat_id)
 
     # If there is an active draft and the response is JSON, update it
     if d:

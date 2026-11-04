@@ -1,7 +1,7 @@
 ---
 name: search-watches
 description: Suchaufträge auf Kleinanzeigen.de einrichten, anzeigen und löschen; neue Treffer werden per Telegram gemeldet.
-allowed-tools: create_search_watch list_search_watches delete_search_watch
+allowed-tools: create_search_watch update_search_watch list_search_watches delete_search_watch
 ---
 
 ## Suchaufträge
@@ -19,9 +19,15 @@ dem der Auftrag angelegt wurde.
    - Ohne `location` wird deutschlandweit gesucht. Ist unklar, ob der Nutzer im Umkreis oder
      deutschlandweit suchen will, frage nach.
    - Preise nur setzen, wenn der Nutzer sie nennt.
-   - Nenne danach kurz, was angelegt wurde. Sage, dass nur neue Treffer gemeldet werden.
-2. **Anzeigen**: `list_search_watches()`. Der Nutzer kann auch /suchauftraege verwenden.
-3. **Löschen**: `delete_search_watch(watch_id=...)`. Passen mehrere Aufträge, frage nach,
+   - Der Bot zeigt danach selbst die aktuellen Treffer mit Link. Bestätige nur kurz, was
+     angelegt wurde, und zähle keine Treffer auf.
+2. **Ändern**: `update_search_watch(watch_id=..., ...)` mit nur den Angaben, die sich ändern.
+   - Korrigiert der Nutzer einen gerade angelegten Auftrag („Nein, nicht deutschlandweit, um
+     Gerolsbach“, „lieber 50 km“, „bis 100 €“), ändere diesen Auftrag. Lege keinen zweiten an.
+   - Für einen anderen Auftrag hole die ID mit `list_search_watches()`.
+   - Deutschlandweit statt Umkreis: `nationwide=true`. Ein neuer Ort schaltet auf Umkreissuche.
+   - Preisgrenzen entfernen: `remove_price_limits=true`.
+   - Auch hier zeigt der Bot danach die aktuellen Treffer.
+3. **Anzeigen**: `list_search_watches()`. Der Nutzer kann auch /suchauftraege verwenden.
+4. **Löschen**: `delete_search_watch(watch_id=...)`. Passen mehrere Aufträge, frage nach,
    welcher gemeint ist.
-
-Ändern geht durch Löschen und neu Anlegen. Sage das, wenn danach gefragt wird.
