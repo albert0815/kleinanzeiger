@@ -30,9 +30,12 @@ from tools import (
     get_lunch_plan,
     get_lunch_planning_data,
     list_kleinanzeigen_ads,
+    list_search_watches,
     mark_kleinanzeigen_ad_sold,
     add_lunches_to_shopping_list,
     add_to_shopping_list,
+    create_search_watch,
+    delete_search_watch,
     propose_lunch_plan,
     propose_recipe,
     read_recipe_from_link,
@@ -63,6 +66,9 @@ _TOOLS = [
     delete_kleinanzeigen_ad,
     mark_kleinanzeigen_ad_sold,
     set_kleinanzeigen_auto_republish,
+    create_search_watch,
+    list_search_watches,
+    delete_search_watch,
 ]
 
 # chat_id -> Agent

@@ -111,6 +111,7 @@ The bot will:
 - `/woche` - Show the lunches of the next seven days
 - `/neu` - Discard current draft and start fresh
 - `/inserate` - Show the ads on Kleinanzeigen; tap an ad for its actions
+- `/suchauftraege` - Show your search watches; tap one to delete it
 - `/queue` - Check queue status (pending/backout jobs)
 - `/backout` - List failed jobs for this chat
 - `/retry_<job_id>` - Retry a specific failed job
@@ -145,6 +146,25 @@ near the top again. Only ads that are online, active and not sold qualify, once
 changes made in the app survive. The run checks the new IDs online and reports the result.
 
 Run the tests with `python -m unittest test_ad_management`.
+
+## Search watches
+
+Ask in the chat, e.g. „Sag mir Bescheid, wenn jemand ein Lego Technic 42056 im Umkreis von
+30 km um 80331 anbietet“ or „Such deutschlandweit nach Rennrad Shimano 105 bis 400 €“. The agent
+creates a watch with search words, optional postcode or place with radius (5–200 km; without a
+place the search covers all of Germany) and optional price limits.
+
+Once a day, at a random time between 20:00 and 21:00, the bot reads the results of each watch,
+sorted by date, with plain HTTP requests; no browser and no login. It reads page after page until
+it reaches results it already knows, at most 5 pages (about 125 results). Only the chat that
+created a watch gets its messages. Creating a watch only records the current results, so the
+evening message lists what is new, with title, price, place and link. Paid TOP placements, which
+are often weeks old, and the suggestions Kleinanzeigen adds when there are few results are
+ignored. After two failed evenings in a row you are told once, and again when the watch works
+again. Watches are stored in
+`<base>/<chat_id>/search-watches.json`, at most 20 per chat.
+
+Run the tests with `python -m unittest test_search_watch`.
 
 ## Recipes
 

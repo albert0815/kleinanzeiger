@@ -20,6 +20,7 @@ import ad_store
 import lunch_plan
 import mahlino
 import recipes
+import search_watch
 
 log = logging.getLogger("kleinanzeigen-agent.tools")
 
@@ -369,3 +370,72 @@ def set_kleinanzeigen_auto_republish(ad_key: str, enabled: bool) -> str:
     log.info("[chat=%d] Auto-republish %s for '%s'", chat_id, enabled, ad.title)
     state = "wird wieder" if enabled else "wird nicht mehr"
     return f"Inserat «{ad.title}» {state} automatisch neu geschaltet."
+
+
+# ---------------------------------------------------------------------------
+# Search watches
+# ---------------------------------------------------------------------------
+
+
+@tool
+def create_search_watch(
+    query: str,
+    location: str | None = None,
+    radius_km: int | None = None,
+    min_price: int | None = None,
+    max_price: int | None = None,
+) -> str:
+    """Set up a search that is checked regularly. New results are sent to this chat.
+
+    Args:
+        query: search words as typed on Kleinanzeigen, e.g. "Lego Technic 42056"
+        location: postcode or place for a radius search; leave empty for all of Germany
+        radius_km: radius around location (5, 10, 20, 30, 50, 100, 150 or 200); default 30
+        min_price: lowest price in EUR, optional
+        max_price: highest price in EUR, optional
+    """
+    chat_id = _chat_id_ctx.get()
+    if chat_id is None:
+        return "Fehler: Kein Nutzerkontext verfügbar."
+    try:
+        watch, count = search_watch.create_watch(
+            chat_id, query, location, radius_km, min_price, max_price
+        )
+    except search_watch.WatchError as e:
+        return f"Fehler: {e}"
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("[chat=%d] creating search watch failed: %s", chat_id, e)
+        return "Fehler: Kleinanzeigen war gerade nicht erreichbar. Versuche es später erneut."
+    return (
+        f"Suchauftrag {watch['id']} angelegt: {search_watch.describe(watch)}. "
+        f"Aktuell gibt es {count} Treffer auf der ersten Seite; die gelten als bekannt. "
+        "Gemeldet werden nur neue Treffer."
+    )
+
+
+@tool
+def list_search_watches() -> list[dict] | str:
+    """List this chat's search watches with id, description and last check (UTC)."""
+    chat_id = _chat_id_ctx.get()
+    if chat_id is None:
+        return "Fehler: Kein Nutzerkontext verfügbar."
+    return [
+        {"id": w["id"], "description": search_watch.describe(w), "checked_at": w["checked_at"]}
+        for w in search_watch.list_watches(chat_id)
+    ]
+
+
+@tool
+def delete_search_watch(watch_id: str) -> str:
+    """Delete one of this chat's search watches.
+
+    Args:
+        watch_id: the id returned by list_search_watches()
+    """
+    chat_id = _chat_id_ctx.get()
+    if chat_id is None:
+        return "Fehler: Kein Nutzerkontext verfügbar."
+    watch = search_watch.delete_watch(chat_id, watch_id)
+    if not watch:
+        return f"Fehler: Kein Suchauftrag mit der ID {watch_id}."
+    return f"Suchauftrag gelöscht: {search_watch.describe(watch)}"
