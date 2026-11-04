@@ -209,8 +209,25 @@ class MainTest(Base):
         edit = self.main.BOT.edit_message_text
         self.assertEqual(edit.await_args.kwargs["message_id"], 7)
         self.assertIn("Typ: Cityräder", edit.await_args.args[0])
+        buttons = [b.text for row in edit.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("🚀 Direkt schalten", buttons)
         self.assertNotIn("ermittelt", edit.await_args.args[0])
         self.main.BOT.send_message.assert_not_awaited()
+
+    def test_publish_button_only_when_fields_are_ready(self):
+        def labels(d):
+            return [b.text for row in self.main.ad_keyboard(d).inline_keyboard for b in row]
+
+        d = self.draft()
+        d.fields_state = "pending"
+        self.assertNotIn("🚀 Direkt schalten", labels(d))
+        self.assertIn("❌ Verwerfen", labels(d))
+        d.fields_state, d.missing_fields = "ready", [FIELDS[1]]
+        self.assertNotIn("🚀 Direkt schalten", labels(d))
+        d.missing_fields = []
+        self.assertIn("🚀 Direkt schalten", labels(d))
+        d.fields_state = "failed"
+        self.assertIn("🚀 Direkt schalten", labels(d))
 
     def test_draft_without_fields_to_fill_drops_pending_note(self):
         d = self.draft()

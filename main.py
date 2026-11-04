@@ -245,7 +245,7 @@ def render_final(d: Draft) -> str:
     )
 
 
-def ad_keyboard() -> InlineKeyboardMarkup:
+def ad_keyboard(d: Draft) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("✅ Copy-Paste", callback_data="ok"),
@@ -253,7 +253,8 @@ def ad_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("❌ Verwerfen", callback_data="cancel")],
     ]
-    if KLEINANZEIGEN_BOT_CMD:
+    # Publishing is offered only once the category's fields are known and filled.
+    if KLEINANZEIGEN_BOT_CMD and d.fields_state != "pending" and not d.missing_fields:
         rows.insert(
             0, [InlineKeyboardButton("🚀 Direkt schalten", callback_data="publish")]
         )
@@ -993,7 +994,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id,
                 render_draft(d),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ad_keyboard(),
+                reply_markup=ad_keyboard(d),
             )
             d.message_id = sent.message_id
             return
@@ -1142,7 +1143,7 @@ async def _process_photos(
         chat_id,
         render_draft(d),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ad_keyboard(),
+        reply_markup=ad_keyboard(d),
     )
     d.message_id = sent.message_id
 
@@ -1161,14 +1162,14 @@ async def _show_draft(chat_id: int, d: Draft) -> None:
         try:
             await BOT.edit_message_text(
                 text, chat_id=chat_id, message_id=d.message_id,
-                parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard(),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard(d),
             )
             return
         except BadRequest as e:
             if "not modified" in str(e).lower():
                 return
             log.info("[chat=%d] could not edit draft message: %s", chat_id, e)
-    sent = await BOT.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard())
+    sent = await BOT.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard(d))
     d.message_id = sent.message_id
 
 
