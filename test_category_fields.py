@@ -202,6 +202,59 @@ class MainTest(Base):
         self.assertIn("  condition_s: ok", text)
         self.assertNotIn("art_s", text)
 
+    def test_draft_message_is_updated_in_place(self):
+        d = self.draft()
+        d.message_id = 7
+        self.complete(d, '{"title": "Kindersitz", "attributes": {"Typ": "Cityräder"}}')
+        edit = self.main.BOT.edit_message_text
+        self.assertEqual(edit.await_args.kwargs["message_id"], 7)
+        self.assertIn("Typ: Cityräder", edit.await_args.args[0])
+        self.assertNotIn("ermittelt", edit.await_args.args[0])
+        self.main.BOT.send_message.assert_not_awaited()
+
+    def test_draft_without_fields_to_fill_drops_pending_note(self):
+        d = self.draft()
+        d.message_id = 7
+        self.complete(d, "{}", fields=mock.AsyncMock(return_value=[FIELDS[0]]))
+        self.assertNotIn("ermittelt", self.main.BOT.edit_message_text.await_args.args[0])
+
+    def test_album_waits_for_slow_downloads(self):
+        processed = []
+
+        async def fake_process(chat_id, photos, context):
+            processed.append(photos)
+
+        async def slow_download(context, file_id):
+            await asyncio.sleep(0.3 if file_id == "slow" else 0)
+            return file_id.encode()
+
+        def update(message_id, file_id):
+            u = mock.MagicMock()
+            u.effective_chat.id = CHAT
+            u.message.media_group_id = "album"
+            u.message.message_id = message_id
+            u.message.photo = [mock.MagicMock(file_id=file_id, width=1, height=1)]
+            return u
+
+        context = mock.MagicMock()
+        context.bot = mock.AsyncMock()
+
+        async def run():
+            with (
+                mock.patch.object(self.main, "_download_photo", slow_download),
+                mock.patch.object(self.main, "_process_photos", fake_process),
+                mock.patch.object(self.main, "ALBUM_DEBOUNCE_SECONDS", 0.1),
+            ):
+                await self.main.on_photo(update(1, "a"), context)
+                second = asyncio.create_task(self.main.on_photo(update(2, "slow"), context))
+                await asyncio.sleep(0.2)  # longer than the debounce, download still running
+                await self.main.on_photo(update(3, "c"), context)
+                await second
+                await asyncio.sleep(0.3)
+
+        asyncio.run(run())
+        self.assertEqual(processed, [[b"a", b"slow", b"c"]])
+
     def test_second_draft_uses_cache(self):
         self.complete(self.draft(), "{}")
         self.complete(self.draft(), "{}").assert_not_awaited()
