@@ -1355,8 +1355,16 @@ async def handle_publish_job(job_data: dict) -> tuple:
     if problems:
         unknown = [p["attribute"] for p in problems if p["kind"] == "unknown"]
         questions = _questions_from_problems(problems, category)
-        if category and "Form rejected" in result.output:
-            category_fields.invalidate(category)  # the form may have changed
+        if category and any(p["kind"] in ("missing", "invalid") for p in problems):
+            # Read the fields again: the form may have changed, and the question
+            # should offer the current options.
+            try:
+                category_fields.store(category, await bot_runner.category_fields(chat_id, category))
+                questions = _questions_from_problems(problems, category)
+            except BotFailure as e:
+                log.warning("[chat=%d] refreshing fields of %s failed: %s", chat_id, category, e)
+                if "Form rejected" in result.output:
+                    category_fields.invalidate(category)
         if unknown:
             _edit_special_attributes(ad_file, {}, unknown)
         if not questions:

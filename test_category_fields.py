@@ -228,23 +228,45 @@ class MainTest(Base):
         ad_file.write_text(f'active: true\ntitle: Kindersitz\ncategory: "{BIKE}"\nprice: 35\n{extra}', encoding="utf-8")
         return ad_file
 
-    def publish(self, ad_file, output):
-        with mock.patch.object(bot_runner, "publish_new", mock.AsyncMock(return_value=bot_runner.BotResult(1, output))):
+    def publish(self, ad_file, output, fields=None):
+        self.fields_call = fields or mock.AsyncMock(return_value=FIELDS)
+        with (
+            mock.patch.object(bot_runner, "publish_new", mock.AsyncMock(return_value=bot_runner.BotResult(1, output))),
+            mock.patch.object(bot_runner, "category_fields", self.fields_call),
+        ):
             return asyncio.run(self.main.handle_publish_job({"chat_id": CHAT, "ad_file": str(ad_file)}))
 
     def test_missing_field_asks_without_retry_then_answer_publishes(self):
-        category_fields.store(BIKE, FIELDS)
         ad_file = self.write_ad()
         ok, message, permanent = self.publish(ad_file, REJECTED)
         self.assertEqual((ok, permanent), (False, True))
+        self.fields_call.assert_awaited_once_with(CHAT, BIKE)
         self.assertIn("Typ", message)
-        self.assertIn("Andere Fahrräder", message)
-        self.assertIsNone(category_fields.cached(BIKE))  # read again next time
+        self.assertIn("Andere Fahrräder", message)  # options from the fresh read
+        self.assertEqual(category_fields.cached(BIKE), FIELDS)
         with mock.patch.object(self.main, "_call_agent", mock.AsyncMock(return_value='{"answers": {"Typ": "Andere Fahrräder"}}')):
             self.assertTrue(asyncio.run(self.main.answer_publish_question(CHAT, "andere")))
         self.assertEqual(yaml.safe_load(ad_file.read_text())["special_attributes"], {"type_s": "Andere Fahrräder"})
         self.enqueue.assert_called_once()
         self.assertEqual(self.main._load_questions(), {})
+
+    def test_failed_refresh_falls_back_to_cached_options_and_drops_cache(self):
+        category_fields.store(BIKE, FIELDS)
+        failing = mock.AsyncMock(side_effect=bot_runner.BotFailure("timeout", "zu langsam"))
+        ok, message, permanent = self.publish(self.write_ad(), REJECTED, fields=failing)
+        self.assertIn("Andere Fahrräder", message)
+        self.assertIsNone(category_fields.cached(BIKE))
+
+    def test_failed_refresh_without_cache_asks_without_options(self):
+        failing = mock.AsyncMock(side_effect=bot_runner.BotFailure("timeout", "zu langsam"))
+        ok, message, permanent = self.publish(self.write_ad(), REJECTED, fields=failing)
+        self.assertIn("• Typ", message)
+        self.assertNotIn("Möglich", message)
+        self.assertTrue(permanent)
+
+    def test_unknown_attribute_does_not_read_fields(self):
+        self.publish(self.write_ad("special_attributes:\n  farbe_s: blau\n"), UNKNOWN)
+        self.fields_call.assert_not_awaited()
 
     def test_invalid_option_asks_with_offered_choices(self):
         ad_file = self.write_ad("special_attributes:\n  type_s: Kindersitz\n")
