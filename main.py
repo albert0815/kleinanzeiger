@@ -143,6 +143,7 @@ class Draft:
     fields: list[dict] | None = None
     fields_category: str = ""
     fields_state: str = "none"  # none | pending | ready | failed
+    message_id: int | None = None  # the Telegram message showing this draft
 
 
 # Mutable per-chat state
@@ -212,15 +213,20 @@ def render_draft(d: Draft) -> str:
             label, shown = (f["label"], category_fields.option_label(f, value)) if f else (attribute, value)
             lines.append(f"• {escape_md(label)}: {escape_md(shown)}")
         details = "\n\n*Details:*\n" + "\n".join(lines)
-    if d.fields_state == "pending":
-        details += "\n\n_Pflichtfelder der Kategorie werden ermittelt …_"
     if d.missing_fields:
         lines = "\n".join(
             f"• {escape_md(_field_question(f['label'], category_fields.options_hint(f)))}"
             for f in d.missing_fields
         )
         details += f"\n\n*Pflichtfeld fehlt – bitte angeben:*\n{lines}"
+    pending = (
+        "⏳ *Noch nicht fertig* – ich ermittle die Felder der Kategorie. "
+        "Der Entwurf wird gleich ergänzt.\n\n"
+        if d.fields_state == "pending"
+        else ""
+    )
     return (
+        f"{pending}"
         f"*{escape_md(d.title)}*\n"
         f"_{escape_md(d.category)} · {escape_md(d.condition)}_\n\n"
         f"{escape_md(d.description)}\n\n"
@@ -244,7 +250,9 @@ def render_final(d: Draft) -> str:
     )
 
 
-def ad_keyboard() -> InlineKeyboardMarkup:
+def ad_keyboard(d: Draft) -> InlineKeyboardMarkup | None:
+    if d.fields_state == "pending":
+        return None  # not finished yet: no actions until the fields are known
     rows = [
         [
             InlineKeyboardButton("✅ Copy-Paste", callback_data="ok"),
@@ -252,7 +260,8 @@ def ad_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("❌ Verwerfen", callback_data="cancel")],
     ]
-    if KLEINANZEIGEN_BOT_CMD:
+    # Publishing is offered only once the category's fields are known and filled.
+    if KLEINANZEIGEN_BOT_CMD and not d.missing_fields:
         rows.insert(
             0, [InlineKeyboardButton("🚀 Direkt schalten", callback_data="publish")]
         )
@@ -988,12 +997,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 # A different category has different fields.
                 d.fields, d.raw_attributes, d.attributes, d.missing_fields = None, {}, {}, []
                 start_field_completion(chat_id, d)
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id,
                 render_draft(d),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ad_keyboard(),
+                reply_markup=ad_keyboard(d),
             )
+            d.message_id = sent.message_id
             return
 
         await context.bot.send_message(chat_id, response, parse_mode=ParseMode.MARKDOWN)
@@ -1012,22 +1022,25 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         photo.height,
         msg.media_group_id or "none",
     )
-    file = await context.bot.get_file(photo.file_id)
-    buf = BytesIO()
-    await file.download_to_memory(buf)
-    img_bytes = buf.getvalue()
-
     if msg.media_group_id:
+        # Register the photo before downloading it: a slow download must not let
+        # the album timer fire early and split the album into two drafts.
         key = (chat_id, msg.media_group_id)
-        entry = PENDING_ALBUMS.get(key)
-        if entry is None:
-            entry = {"photos": [], "task": None}
-            PENDING_ALBUMS[key] = entry
-        entry["photos"].append(img_bytes)
+        entry = PENDING_ALBUMS.setdefault(key, {"photos": [], "task": None, "pending": 0})
         if entry["task"]:
             entry["task"].cancel()
-        entry["task"] = asyncio.create_task(_process_album_after_delay(key, context))
+            entry["task"] = None
+        entry["pending"] += 1
+        try:
+            img_bytes = await _download_photo(context, photo.file_id)
+            entry["photos"].append((msg.message_id, img_bytes))
+        finally:
+            entry["pending"] -= 1
+        if entry["pending"] == 0:
+            entry["task"] = asyncio.create_task(_process_album_after_delay(key, context))
         return
+
+    img_bytes = await _download_photo(context, photo.file_id)
 
     # Cancel any in-progress generation for this chat
     existing = ACTIVE_GENERATION_TASKS.get(chat_id)
@@ -1066,6 +1079,13 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task.add_done_callback(_on_task_done)
 
 
+async def _download_photo(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+    file = await context.bot.get_file(file_id)
+    buf = BytesIO()
+    await file.download_to_memory(buf)
+    return buf.getvalue()
+
+
 async def _process_album_after_delay(
     key: tuple[int, str], context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1076,8 +1096,9 @@ async def _process_album_after_delay(
     entry = PENDING_ALBUMS.pop(key, None)
     if not entry:
         return
+    photos = [img for _message_id, img in sorted(entry["photos"], key=lambda p: p[0])]
     await context.bot.send_message(key[0], "🤖 Analysiere Album…")
-    await _process_photos(key[0], entry["photos"], context)
+    await _process_photos(key[0], photos, context)
 
 
 async def _process_photos(
@@ -1114,7 +1135,10 @@ async def _process_photos(
             pass  # keep original order on any error
     if not d.title:
         d.title = "?"
+    previous = DRAFTS.get(chat_id)
     DRAFTS[chat_id] = d
+    if previous and previous.message_id:
+        await _retire_draft_message(chat_id, previous.message_id)
     log.info(
         "[chat=%d] draft created: title=%r price=%s",
         chat_id,
@@ -1122,12 +1146,38 @@ async def _process_photos(
         d.price_eur,
     )
     start_field_completion(chat_id, d)
-    await context.bot.send_message(
+    sent = await context.bot.send_message(
         chat_id,
         render_draft(d),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ad_keyboard(),
+        reply_markup=ad_keyboard(d),
     )
+    d.message_id = sent.message_id
+
+
+async def _retire_draft_message(chat_id: int, message_id: int) -> None:
+    try:
+        await BOT.edit_message_text("↪️ Ersetzt durch den neuen Entwurf.", chat_id=chat_id, message_id=message_id)
+    except BadRequest as e:
+        log.info("[chat=%d] could not retire draft message: %s", chat_id, e)
+
+
+async def _show_draft(chat_id: int, d: Draft) -> None:
+    """Update the draft's message in place; send a new one if that fails."""
+    text = render_draft(d)
+    if d.message_id:
+        try:
+            await BOT.edit_message_text(
+                text, chat_id=chat_id, message_id=d.message_id,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard(d),
+            )
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            log.info("[chat=%d] could not edit draft message: %s", chat_id, e)
+    sent = await BOT.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard(d))
+    d.message_id = sent.message_id
 
 
 async def complete_draft_fields(chat_id: int, d: Draft) -> None:
@@ -1145,6 +1195,7 @@ async def complete_draft_fields(chat_id: int, d: Draft) -> None:
             log.error("[chat=%d] reading fields for %s failed: %s", chat_id, category, e)
             if DRAFTS.get(chat_id) is d:
                 d.fields_state = "failed"
+                await _show_draft(chat_id, d)
                 await BOT.send_message(
                     chat_id,
                     f"⚠️ Die Felder der Kategorie konnten nicht gelesen werden: {e}\n"
@@ -1176,10 +1227,7 @@ async def complete_draft_fields(chat_id: int, d: Draft) -> None:
             _apply_dict_to_draft(d, parsed)
     _validate_draft_fields(d)
     d.fields_state = "ready"
-    if todo:
-        await BOT.send_message(
-            chat_id, render_draft(d), parse_mode=ParseMode.MARKDOWN, reply_markup=ad_keyboard()
-        )
+    await _show_draft(chat_id, d)
 
 
 def start_field_completion(chat_id: int, d: Draft) -> asyncio.Task:
