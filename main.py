@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import html
 import json
 import logging
 import os
@@ -22,7 +23,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Message,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -41,6 +49,7 @@ import category_fields
 import lunch_plan
 import mahlino
 import recipes
+import search_watch
 from agent_registry import clear_agent, get_agent
 from background_worker import BackgroundWorker
 from queue_manager import QueueManager
@@ -80,6 +89,12 @@ FAILURE_HINTS = {
 WEEKDAYS = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
 ONLINE_STATE_LABELS = {"active": "🟢 online", "reserved": "🟡 reserviert"}
 OTHER_STATE_LABEL = "⚪ deaktiviert"
+# Search watches are checked once a day at a random time between 20:00 and 21:00.
+SEARCH_WATCH_TIME = datetime.time(20, 0)
+SEARCH_WATCH_MAX_JITTER_SECONDS = 55 * 60
+SEARCH_WATCH_PAUSE_SECONDS = (2.0, 6.0)
+# Leaves room for the closing line within Telegram's message limit.
+SEARCH_WATCH_TEXT_BUDGET = 3600
 
 
 def _user_work_dir(chat_id: int) -> Path:
@@ -162,6 +177,7 @@ BOT_COMMANDS = [
     BotCommand("lunch", "Heutiges Mittagessen anzeigen"),
     BotCommand("woche", "Essensplan der nächsten 7 Tage anzeigen"),
     BotCommand("plan", "Essensplan für nächste Woche vorschlagen"),
+    BotCommand("suchauftraege", "Suchaufträge anzeigen und löschen"),
     BotCommand("queue", "Status der Warteschlange anzeigen"),
     BotCommand("backout", "Fehlgeschlagene Aufträge anzeigen und wiederholen"),
     BotCommand("help", "Hilfe und alle Befehle anzeigen"),
@@ -742,6 +758,95 @@ async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("[chat=%d] scheduled online check failed", user_id)
 
 
+def _watch_delete_button(watch: dict) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        f"🗑 {search_watch.describe(watch)}"[:60], callback_data=f"wdel:{watch['id']}"
+    )
+
+
+def format_watch_hits(
+    watch: dict, hits: list[search_watch.Hit], complete: bool = True
+) -> str:
+    """HTML message listing new hits of a watch, newest first, within Telegram's limit."""
+    count = f"{len(hits)}" if complete else f"Mehr als {len(hits)}"
+    lines = [
+        f"🔔 {count} neu bei Kleinanzeigen für {html.escape(search_watch.describe(watch))}:"
+    ]
+    length = len(lines[0])
+    listed = 0
+    for hit in hits:
+        details = " · ".join(p for p in (hit.price, hit.location, hit.date) if p)
+        entry = f"\n<a href=\"{html.escape(hit.url)}\">{html.escape(hit.title or 'Anzeige')}</a>" + (
+            f"\n{html.escape(details)}" if details else ""
+        )
+        if length + len(entry) > SEARCH_WATCH_TEXT_BUDGET:
+            break
+        lines.append(entry)
+        length += len(entry) + 1
+        listed += 1
+    if listed < len(hits) or not complete:
+        rest = "weitere" if complete else "noch mehr"
+        others = f"… und {len(hits) - listed} {rest}" if listed < len(hits) else f"… und {rest}"
+        url = html.escape(search_watch.search_url(watch))
+        lines.append(f"\n{others}. <a href=\"{url}\">Alle Treffer ansehen</a>")
+    return "\n".join(lines)
+
+
+async def _report_watch_result(chat_id: int, result: search_watch.CheckResult) -> None:
+    watch = result.watch
+    description = search_watch.describe(watch)
+    if result.notice == "failed":
+        await BOT.send_message(
+            chat_id,
+            f"⚠️ Der Suchauftrag {description} lässt sich gerade nicht prüfen "
+            f"({result.error}). Ich versuche es jeden Abend weiter und melde mich, "
+            "wenn es wieder geht.",
+        )
+    elif result.notice == "recovered":
+        await BOT.send_message(chat_id, f"✅ Der Suchauftrag {description} läuft wieder.")
+    if not result.new_hits:
+        return
+    await BOT.send_message(
+        chat_id,
+        format_watch_hits(watch, result.new_hits, result.complete),
+        parse_mode=ParseMode.HTML,
+        # One hit: show its photo. Several: a single preview would be misleading.
+        link_preview_options=LinkPreviewOptions(is_disabled=len(result.new_hits) != 1),
+        reply_markup=InlineKeyboardMarkup([[_watch_delete_button(watch)]]),
+    )
+
+
+async def check_search_watches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: check every watch one after another and report new hits."""
+    await asyncio.sleep(random.uniform(0, SEARCH_WATCH_MAX_JITTER_SECONDS))
+    for chat_id in search_watch.all_chat_ids():
+        if chat_id not in ALLOWED_USER_IDS:
+            continue
+        for watch in search_watch.list_watches(chat_id):
+            await asyncio.sleep(random.uniform(*SEARCH_WATCH_PAUSE_SECONDS))
+            try:
+                result = await asyncio.to_thread(search_watch.check_watch, chat_id, watch["id"])
+                if result:
+                    await _report_watch_result(chat_id, result)
+            except Exception:
+                log.exception("[chat=%d] search watch %s failed", chat_id, watch["id"])
+
+
+async def cmd_search_watches(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    watches = search_watch.list_watches(update.effective_chat.id)
+    if not watches:
+        await update.message.reply_text(
+            "Du hast keine Suchaufträge. Schreib mir z. B.: „Sag mir Bescheid, wenn jemand "
+            "ein Lego Technic 42056 im Umkreis von 30 km um 80331 anbietet.“"
+        )
+        return
+    await update.message.reply_text(
+        f"Deine Suchaufträge ({len(watches)}), geprüft jeden Abend zwischen 20 und 21 Uhr. "
+        "Tippe auf einen, um ihn zu löschen.",
+        reply_markup=InlineKeyboardMarkup([[_watch_delete_button(w)] for w in watches]),
+    )
+
+
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     commands = "\n".join(f"/{c.command} — {c.description}" for c in BOT_COMMANDS)
     await update.message.reply_text(
@@ -754,6 +859,9 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "🍽️ Mittagessen-Planung\n"
         "Jeden Morgen um 08:30 schicke ich dir den aktuellen Essensplan. Falls für "
         "die nächste Woche noch etwas fehlt, schlage ich einen Plan vor.\n\n"
+        "🔔 Suchaufträge\n"
+        "Sag mir, wonach ich auf Kleinanzeigen suchen soll, im Umkreis oder "
+        "deutschlandweit. Neue Treffer schicke ich dir jeden Abend.\n\n"
         "📖 Rezepte\n"
         "Schick mir einen Link zu einem Rezept oder beschreib es, dann lege ich es "
         "nach deiner Bestätigung in Mahlino an.\n\n"
@@ -1560,6 +1668,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     log.info("[chat=%d] button pressed: %r", chat_id, q.data)
 
+    # ── Search watches ──────────────────────────────────────────────────
+    if q.data.startswith("wdel:"):
+        watch = search_watch.delete_watch(chat_id, q.data.partition(":")[2])
+        await context.bot.send_message(
+            chat_id,
+            f"🗑 Suchauftrag gelöscht: {search_watch.describe(watch)}"
+            if watch
+            else "Diesen Suchauftrag gibt es nicht mehr.",
+        )
+        return
+
     # ── Ad management ───────────────────────────────────────────────────
     if q.data == "nop":
         await q.edit_message_text("Abgebrochen.")
@@ -1874,6 +1993,12 @@ def main() -> None:
                     time=sync_time.replace(tzinfo=LUNCH_PLAN_TZ),
                     name=f"kleinanzeigen_sync_{sync_time:%H%M}",
                 )
+        app.job_queue.run_daily(
+            check_search_watches,
+            time=SEARCH_WATCH_TIME.replace(tzinfo=LUNCH_PLAN_TZ),
+            name="search_watches_daily",
+        )
+        log.info("Search watches are checked daily between 20:00 and 21:00 Europe/Berlin")
         # Schedule daily lunch plan message at 08:30 Europe/Berlin
         app.job_queue.run_daily(
             send_lunch_plan,
@@ -1910,6 +2035,9 @@ def main() -> None:
     app.add_handler(CommandHandler("lunch", cmd_lunch, filters=user_filter))
     app.add_handler(CommandHandler("woche", cmd_woche, filters=user_filter))
     app.add_handler(CommandHandler("plan", cmd_plan, filters=user_filter))
+    app.add_handler(
+        CommandHandler("suchauftraege", cmd_search_watches, filters=user_filter)
+    )
     app.add_handler(CommandHandler("queue", cmd_queue_status, filters=user_filter))
     app.add_handler(CommandHandler("backout", cmd_backout_jobs, filters=user_filter))
     app.add_handler(
