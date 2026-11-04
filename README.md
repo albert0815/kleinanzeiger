@@ -127,6 +127,15 @@ managed like all others. `/inserate` only shows what is on Kleinanzeigen. Each a
 excluded from automatic republishing there.
 You are told once about new differences and once when access fails or recovers.
 
+## Category fields
+
+`kleinanzeigen-bot` is built with a `fields` command (see `scripts/patch_category_fields_command.py`):
+`kleinanzeigen-bot fields --category=<name or id>` selects the category in the ad form and prints its
+fields with required flag and options, without submitting. Drafts use it to fill in fields such as
+"Typ" or "Größe"; results are cached per category for 30 days in `<base>/.category-fields.json`.
+If Kleinanzeigen still rejects an ad, the bot's error names the field, and the agent asks for the value
+instead of retrying.
+
 ## Republishing
 
 With `KLEINANZEIGEN_AUTO_REPUBLISH=true`, a daily run republishes ads so they show up

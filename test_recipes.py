@@ -217,6 +217,9 @@ class ToolAndBotTest(Base):
 
         self.main, self.tools = main, tools
         main.BOT = mock.AsyncMock()
+        users = mock.patch.object(main, "ALLOWED_USER_IDS", {1})
+        users.start()
+        self.addCleanup(users.stop)
         tools.set_agent_chat_id(1)
 
     def propose(self, **extra):
