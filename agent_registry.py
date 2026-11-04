@@ -42,6 +42,7 @@ from tools import (
     refresh_kleinanzeigen_status,
     search_kleinanzeigen_categories,
     set_kleinanzeigen_auto_republish,
+    update_search_watch,
 )
 
 log = logging.getLogger("kleinanzeigen-agent.registry")
@@ -68,6 +69,7 @@ _TOOLS = [
     set_kleinanzeigen_auto_republish,
     create_search_watch,
     list_search_watches,
+    update_search_watch,
     delete_search_watch,
 ]
 

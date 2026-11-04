@@ -119,8 +119,8 @@ class ParseTest(unittest.TestCase):
 class WatchTest(Base):
     def test_nationwide_watch_reports_only_new_hits(self):
         self.serve(page("2", "1"), page("3", "2", "1"), page("3", "2", "1"))
-        watch, count = search_watch.create_watch(CHAT, "  lego   technic ", max_price=50)
-        self.assertEqual(count, 2)
+        watch, hits = search_watch.create_watch(CHAT, "  lego   technic ", max_price=50)
+        self.assertEqual([h.id for h in hits], ["2", "1"])
         self.assertEqual(watch["query"], "lego technic")
         params = self.requests[0].url.params
         self.assertEqual(params["keywords"], "lego technic")
@@ -135,8 +135,8 @@ class WatchTest(Base):
 
     def test_radius_watch_resolves_location(self):
         self.serve(page(), locations={"_0": "Deutschland", "_6443": "80331 Altstadt-Lehel"})
-        watch, count = search_watch.create_watch(CHAT, "rennrad", "80331", radius_km=25)
-        self.assertEqual(count, 0)
+        watch, hits = search_watch.create_watch(CHAT, "rennrad", "80331", radius_km=25)
+        self.assertEqual(hits, [])
         self.assertEqual(watch["location_id"], "6443")
         self.assertEqual(watch["radius_km"], 20)
         self.assertEqual(self.requests[0].url.params["query"], "80331")
@@ -214,6 +214,107 @@ class WatchTest(Base):
             search_watch.create_watch(CHAT, f"q{i}")
         with self.assertRaises(search_watch.WatchError):
             search_watch.create_watch(CHAT, "zu viel")
+
+
+GEROLSBACH = {"_0": "Deutschland", "_15559": "Gerolsbach - Bayern"}
+
+
+class UpdateTest(Base):
+    def test_nationwide_to_radius_and_back(self):
+        self.serve(page("1"), page("5", "4"), page("9"), locations=GEROLSBACH)
+        watch, _ = search_watch.create_watch(CHAT, "lego", max_price=50)
+
+        changed, hits = search_watch.update_watch(CHAT, watch["id"], location="Gerolsbach")
+        self.assertEqual([h.id for h in hits], ["5", "4"])
+        self.assertEqual(
+            search_watch.describe(changed), "«lego» bis 50 € · 30 km um Gerolsbach - Bayern"
+        )
+        [stored] = search_watch.list_watches(CHAT)
+        self.assertEqual((stored["id"], stored["seen"]), (watch["id"], ["5", "4"]))
+        search = self.requests[-1].url.params
+        self.assertEqual((search["locationId"], search["radius"], search["maxPrice"]), ("15559", "30", "50"))
+
+        changed, _ = search_watch.update_watch(
+            CHAT, watch["id"], nationwide=True, remove_price_limits=True, query="lego technic"
+        )
+        self.assertEqual(search_watch.describe(changed), "«lego technic» · deutschlandweit")
+        self.assertNotIn("locationId", self.requests[-1].url.params)
+        self.assertEqual(len(search_watch.list_watches(CHAT)), 1)
+
+    def test_radius_only_keeps_location(self):
+        self.serve(page("1"), page("1"), locations=GEROLSBACH)
+        watch, _ = search_watch.create_watch(CHAT, "lego", "Gerolsbach", 10)
+        changed, _ = search_watch.update_watch(CHAT, watch["id"], radius_km=50, min_price=5)
+        self.assertEqual(
+            search_watch.describe(changed), "«lego» · 50 km um Gerolsbach - Bayern"
+        )
+        self.assertEqual(changed["min_price"], 5)
+
+    def test_rejects_bad_changes_and_keeps_watch(self):
+        self.serve(page("1"))
+        watch, _ = search_watch.create_watch(CHAT, "lego", max_price=50)
+        for kwargs in (
+            {"radius_km": 20},
+            {"nationwide": True, "location": "80331"},
+            {"min_price": 80},
+            {"query": " "},
+        ):
+            with self.assertRaises(search_watch.WatchError):
+                search_watch.update_watch(CHAT, watch["id"], **kwargs)
+        with self.assertRaises(search_watch.WatchError):
+            search_watch.update_watch(CHAT, "unbekannt", query="x")
+        self.assertEqual(search_watch.list_watches(CHAT), [watch])
+
+
+class OverviewTest(Base):
+    def test_agent_tool_leads_to_one_overview_per_watch(self):
+        import main
+        import tools
+
+        self.serve(page("2", "1"), page("3"), locations=GEROLSBACH)
+        tools.set_agent_chat_id(CHAT)
+        reply = tools.create_search_watch(query="lego")
+        self.assertIn("angelegt", reply)
+        watch_id = search_watch.list_watches(CHAT)[0]["id"]
+        reply = tools.update_search_watch(watch_id=watch_id, location="Gerolsbach", radius_km=20)
+        self.assertIn("geändert", reply)
+
+        bot = mock.AsyncMock()
+        with mock.patch.object(main, "BOT", bot):
+            asyncio.run(main.announce_watch_overviews(CHAT))
+            asyncio.run(main.announce_watch_overviews(CHAT))
+        bot.send_message.assert_awaited_once()
+        text = bot.send_message.call_args.args[1]
+        self.assertIn("20 km um Gerolsbach - Bayern", text)
+        self.assertIn("/3-23-1", text)
+        self.assertNotIn("/2-23-1", text)
+        self.assertIn("Alle Treffer ansehen", text)
+
+    def test_no_overview_for_deleted_watch(self):
+        import main
+        import tools
+
+        self.serve(page())
+        tools.set_agent_chat_id(CHAT)
+        tools.create_search_watch(query="lego")
+        tools.delete_search_watch(watch_id=search_watch.list_watches(CHAT)[0]["id"])
+        bot = mock.AsyncMock()
+        with mock.patch.object(main, "BOT", bot):
+            asyncio.run(main.announce_watch_overviews(CHAT))
+        bot.send_message.assert_not_awaited()
+
+    def test_overview_text(self):
+        import main
+
+        watch = {"query": "x", "location_id": None, "max_price": None}
+        hits = [
+            search_watch.Hit(str(i), f"T{i}", "1 €", "Ort", "Heute", f"https://k/{i}")
+            for i in range(25)
+        ]
+        text = main.format_watch_overview(watch, hits)
+        self.assertEqual(text.count("https://k/"), main.SEARCH_WATCH_OVERVIEW_HITS)
+        self.assertIn("Alle Treffer ansehen", text)
+        self.assertIn("Aktuell gibt es keine Treffer", main.format_watch_overview(watch, []))
 
 
 class NotificationTest(Base):
