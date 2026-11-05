@@ -273,6 +273,16 @@ class MainTest(Base):
         asyncio.run(run())
         self.assertEqual(processed, [[b"a", b"slow", b"c"]])
 
+    def test_draft_json_with_raw_line_breaks_is_read(self):
+        # As written by the model on 2026-11-05: a paragraph break inside the description.
+        response = (
+            '{\n  "title": "Kindersitz",\n  "description": "Gut erhalten.\n\nTierfreier Nichtraucherhaushalt.",\n'
+            '  "price_eur": 45,\n  "attributes": {}\n}'
+        )
+        parsed = self.main._parse_json_from_response(response)
+        self.assertEqual(parsed["description"], "Gut erhalten.\n\nTierfreier Nichtraucherhaushalt.")
+        self.assertIsNone(self.main._parse_json_from_response("kein JSON"))
+
     def test_second_draft_uses_cache(self):
         self.complete(self.draft(), "{}")
         self.complete(self.draft(), "{}").assert_not_awaited()
