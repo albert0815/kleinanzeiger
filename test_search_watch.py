@@ -317,6 +317,33 @@ class OverviewTest(Base):
         self.assertIn("Aktuell gibt es keine Treffer", main.format_watch_overview(watch, []))
 
 
+class AgentSyncTest(Base):
+    def test_button_delete_reaches_agent_once(self):
+        import main
+        import tools
+
+        self.serve(page("1"), page("1"))
+        tools.set_agent_chat_id(CHAT)
+        tools.create_search_watch(query="gardenpole")
+        [watch] = search_watch.list_watches(CHAT)
+
+        query = mock.Mock(data=f"wdel:{watch['id']}", from_user=mock.Mock(id=CHAT))
+        query.answer = mock.AsyncMock()
+        update = mock.Mock(callback_query=query, effective_chat=mock.Mock(id=CHAT))
+        context = mock.Mock(bot=mock.AsyncMock())
+        with mock.patch.object(main, "ALLOWED_USER_IDS", {CHAT}):
+            asyncio.run(main.on_button(update, context))
+        self.assertEqual(search_watch.list_watches(CHAT), [])
+
+        first = main._build_agent_input(CHAT, "Wieder anlegen")
+        self.assertIn(f"den Suchauftrag {watch['id']} gelöscht", first)
+        self.assertTrue(first.endswith("Wieder anlegen"))
+        self.assertEqual(main._build_agent_input(CHAT, "Danke"), "Danke")
+
+        reply = tools.create_search_watch(query="gardenpole")
+        self.assertIn("insgesamt 1 Suchauftrag.", reply)
+
+
 class NotificationTest(Base):
     def test_new_hits_go_to_the_owner(self):
         import main
