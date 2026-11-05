@@ -308,7 +308,9 @@ def _parse_json_from_response(response: str) -> dict | None:
     if not match:
         return None
     try:
-        return json.loads(match.group(0))
+        # strict=False accepts raw line breaks inside strings, which the model
+        # sometimes writes into the description instead of "\n".
+        return json.loads(match.group(0), strict=False)
     except (json.JSONDecodeError, ValueError):
         return None
 
