@@ -415,8 +415,11 @@ def _watch_change(done: str, chat_id: int, change) -> str:
         log.warning("[chat=%d] search watch change failed: %s", chat_id, e)
         return "Fehler: Kleinanzeigen war gerade nicht erreichbar. Versuche es später erneut."
     search_watch.store_overview(chat_id, watch, hits)
+    total = len(search_watch.list_watches(chat_id))
     return (
         f"Suchauftrag {watch['id']} {done}: {search_watch.describe(watch)}. "
+        f"Der Nutzer hat jetzt insgesamt {total} "
+        f"{'Suchauftrag' if total == 1 else 'Suchaufträge'}. "
         f"Aktuell {len(hits)} Treffer auf der ersten Seite. Der Bot zeigt sie gleich mit Link "
         "an; zähle sie nicht auf. Ab jetzt meldet er jeden Abend zwischen 20 und 21 Uhr "
         "nur neue Treffer."

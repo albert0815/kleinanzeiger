@@ -457,11 +457,32 @@ async def sync_account(chat_id: int, *, announce: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Things the user did outside the agent, e.g. via buttons. They are passed on with
+# the next message so the agent does not rely on an outdated conversation.
+_AGENT_NOTES: dict[int, list[str]] = {}
+
+
+def note_for_agent(chat_id: int, note: str) -> None:
+    _AGENT_NOTES.setdefault(chat_id, []).append(note)
+
+
+def _with_agent_notes(chat_id: int, message: str) -> str:
+    notes = _AGENT_NOTES.pop(chat_id, [])
+    if not notes:
+        return message
+    listed = "\n".join(f"- {n}" for n in notes)
+    return (
+        f"[Hinweis vom Bot, nicht vom Nutzer geschrieben. Seit deiner letzten Antwort hat "
+        f"der Nutzer per Button:\n{listed}]\n\n{message}"
+    )
+
+
 def _build_agent_input(
     chat_id: int,
     message: str,
     photos: list[bytes] | None = None,
 ) -> str | list:
+    message = _with_agent_notes(chat_id, message)
     if photos:
         content: list[dict] = []
         for img in photos[:8]:
@@ -1719,6 +1740,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ── Search watches ──────────────────────────────────────────────────
     if q.data.startswith("wdel:"):
         watch = search_watch.delete_watch(chat_id, q.data.partition(":")[2])
+        if watch:
+            note_for_agent(
+                chat_id,
+                f"den Suchauftrag {watch['id']} gelöscht ({search_watch.describe(watch)})",
+            )
         await context.bot.send_message(
             chat_id,
             f"🗑 Suchauftrag gelöscht: {search_watch.describe(watch)}"
