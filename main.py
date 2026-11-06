@@ -49,6 +49,7 @@ import category_fields
 import lunch_plan
 import mahlino
 import recipes
+import recipe_import_api
 import search_watch
 from agent_registry import clear_agent, get_agent
 from background_worker import BackgroundWorker
@@ -694,9 +695,15 @@ async def announce_recipe_proposal(chat_id: int) -> None:
     proposal = recipes.take_unannounced(chat_id)
     if not proposal:
         return
+    if proposal.get("image_url"):
+        # Only a preview; Telegram fetches the picture itself and may fail.
+        try:
+            await BOT.send_photo(chat_id, proposal["image_url"], caption="📷 Foto von der Seite")
+        except Exception as e:
+            log.info("[chat=%d] recipe photo preview failed: %s", chat_id, e)
     await BOT.send_message(
         chat_id,
-        recipes.format_proposal(proposal["recipe"]),
+        recipes.format_proposal(proposal["recipe"], has_image=bool(proposal.get("image_url"))),
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -1841,12 +1848,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=q.message.reply_markup if q.message else None,
             )
             return
-        await context.bot.send_message(
-            chat_id,
-            f"✅ Rezept gespeichert: {created['title']}"
-            if created
-            else "Dieses Rezept ist nicht mehr offen oder wurde schon bearbeitet.",
-        )
+        if not created:
+            text = "Dieses Rezept ist nicht mehr offen oder wurde schon bearbeitet."
+        else:
+            text = f"✅ Rezept gespeichert: {created['title']}"
+            if created.get("image_saved") is False:
+                text += "\nDas Foto ließ sich nicht übernehmen."
+        await context.bot.send_message(chat_id, text)
         return
 
     if q.data.startswith("plan_accept:"):
@@ -2033,6 +2041,7 @@ def main() -> None:
     # Register post_init to start the background worker
     async def post_init(app: Application) -> None:
         await BACKGROUND_WORKER.start()
+        recipe_import_api.start_server()
         await app.bot.set_my_commands(BOT_COMMANDS)
         loop = asyncio.get_running_loop()
 

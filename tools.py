@@ -239,7 +239,7 @@ def propose_recipe(
         r["name"].casefold() == wanted for r in mahlino.fetch_recipes_sync()
     ):
         return f"Ein Rezept «{recipe['title']}» gibt es schon. Frage nach, ob es trotzdem angelegt werden soll."
-    recipes.store_proposal(chat_id, recipe)
+    recipes.store_proposal(chat_id, recipe, recipes.image_for(recipe["source_url"]))
     return "Der Vorschlag wurde angelegt. Der Bot zeigt ihn gleich mit Buttons an. Wiederhole ihn nicht."
 
 

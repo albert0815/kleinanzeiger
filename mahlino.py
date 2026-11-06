@@ -168,6 +168,17 @@ def add_days_to_shopping_list_sync(days: list[str]) -> None:
     resp.raise_for_status()
 
 
+def set_recipe_image_from_url_sync(slug: str, url: str) -> None:
+    """Mahlino downloads the photo itself and checks that it is a public address."""
+    resp = httpx.put(
+        f"{MAHLINO_URL}/api/v1/recipes/{slug}/image/from-url",
+        json={"url": url},
+        headers=_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
 def create_recipe_sync(recipe: dict) -> dict:
     resp = httpx.post(
         f"{MAHLINO_URL}/api/v1/recipes",

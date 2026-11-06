@@ -106,6 +106,28 @@ class ReadPageTest(FakeTransportMixin, unittest.TestCase):
             result = recipes.read_recipe_page(" https://rezept.example/x ")
         self.assertEqual(result["source_url"], "https://rezept.example/x")
         self.assertIsNone(result["page_text"])
+        self.assertEqual(result["image_url"], "https://rezept.example/x.jpg")
+        self.assertEqual(recipes.image_for("https://rezept.example/x"), "https://rezept.example/x.jpg")
+
+
+class ImageTest(unittest.TestCase):
+    def test_og_image_wins_and_is_made_absolute(self):
+        page = PAGE.replace("<head>", '<head><meta content="/bilder/brot.jpg" property="og:image">')
+        self.assertEqual(
+            recipes.find_image(page, "https://rezept.example/x"),
+            "https://rezept.example/bilder/brot.jpg",
+        )
+
+    def test_falls_back_to_recipe_image(self):
+        self.assertEqual(recipes.find_image(PAGE, "https://rezept.example/x"), "https://rezept.example/x.jpg")
+        page = PAGE.replace('"image":"x.jpg"', '"image":[{"@type":"ImageObject","url":"https://cdn.example/b.jpg"}]')
+        self.assertEqual(recipes.find_image(page, "https://rezept.example/x"), "https://cdn.example/b.jpg")
+
+    def test_no_image(self):
+        self.assertIsNone(recipes.find_image("<html></html>", "https://rezept.example/x"))
+        self.assertIsNone(
+            recipes.find_image('<meta property="og:image" content="javascript:x">', "https://rezept.example/")
+        )
 
 
 class BuildTest(unittest.TestCase):
@@ -179,6 +201,24 @@ class ProposalTest(Base):
             self.assertIsNone(recipes.save_proposal(1, proposal["id"]))
         create.assert_called_once()
 
+    def test_photo_is_saved_after_recipe(self):
+        proposal = recipes.store_proposal(1, recipe(), "https://rezept.example/x.jpg")
+        create = mock.Mock(return_value={"title": "Brot", "slug": "brot"})
+        photo = mock.Mock()
+        with mock.patch.object(mahlino, "create_recipe_sync", create), mock.patch.object(
+            mahlino, "set_recipe_image_from_url_sync", photo
+        ):
+            self.assertTrue(recipes.save_proposal(1, proposal["id"])["image_saved"])
+        photo.assert_called_once_with("brot", "https://rezept.example/x.jpg")
+
+    def test_failed_photo_keeps_recipe(self):
+        proposal = recipes.store_proposal(1, recipe(), "https://rezept.example/x.jpg")
+        with mock.patch.object(
+            mahlino, "create_recipe_sync", return_value={"title": "Brot", "slug": "brot"}
+        ), mock.patch.object(mahlino, "set_recipe_image_from_url_sync", side_effect=OSError("weg")):
+            self.assertIs(recipes.save_proposal(1, proposal["id"])["image_saved"], False)
+        self.assertIsNone(recipes.take_unannounced(1))
+
     def test_other_chat_cannot_save(self):
         proposal = recipes.store_proposal(1, recipe())
         self.assertIsNone(recipes.save_proposal(2, proposal["id"]))
@@ -226,6 +266,11 @@ class ToolAndBotTest(Base):
         existing = [{"id": "brot", "name": "BROT", "lastPlanDate": None, "minutes": None}]
         with mock.patch.object(mahlino, "fetch_recipes_sync", return_value=existing):
             return self.tools.propose_recipe(title="Brot", ingredients=INGREDIENTS, **extra)
+
+    def test_proposal_takes_picture_of_read_page(self):
+        with mock.patch.dict(recipes._PAGE_IMAGES, {"https://rezept.example/brot": "https://rezept.example/b.jpg"}):
+            self.propose(source_url="https://rezept.example/brot", allow_duplicate=True)
+        self.assertEqual(recipes.take_unannounced(1)["image_url"], "https://rezept.example/b.jpg")
 
     def test_duplicate_needs_confirmation(self):
         self.assertIn("gibt es schon", self.propose())

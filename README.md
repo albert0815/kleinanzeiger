@@ -174,6 +174,14 @@ Run the tests with `python -m unittest test_search_watch`.
 Send a link or describe a recipe in the chat. The bot shows a proposal and creates the
 recipe in Mahlino after you press the button. Links must lead to public addresses.
 
+Mahlino can use the same import from its recipe page. The bot serves
+`POST /recipes/import` with `{"url": "..."}` on port 8090 (`RECIPE_IMPORT_PORT`), checked
+against `MAHLINO_API_KEY` in the header `X-API-Key`. It answers with the recipe in the shape of
+Mahlino's `RecipeIn` and saves nothing; the user checks the form in Mahlino and saves there.
+Without `MAHLINO_API_KEY` the endpoint is off. Mahlino reaches it over the Docker network
+`web` as `http://kleinanzeigen-agent:8090`. Run the tests with
+`python -m unittest test_recipe_import_api`.
+
 ## Queue System
 
 The system uses a persistent queue for ad publishing:
