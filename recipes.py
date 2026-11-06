@@ -33,6 +33,12 @@ _TIP_PREFIX = re.compile(r"^(unser tipp|tipp|hinweis|achtung|info)\s*:", re.IGNO
 _JSON_LD = re.compile(
     r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", re.DOTALL | re.IGNORECASE
 )
+_META_TAG = re.compile(r"<meta\s[^>]*>", re.IGNORECASE)
+_META_ATTR = re.compile(r"""([\w:-]+)\s*=\s*("[^"]*"|'[^']*')""")
+# Bilder der zuletzt gelesenen Seiten, damit propose_recipe sie ohne Umweg über
+# das Modell findet (lange Bild-Links würde es gern verstümmeln).
+_PAGE_IMAGES: dict[str, str] = {}
+_MAX_PAGE_IMAGES = 50
 
 
 class RecipeError(ValueError):
@@ -92,25 +98,67 @@ def _find_recipe(node) -> dict | None:
     return None
 
 
-def extract_structured_recipe(page: str) -> dict | None:
-    """Return the schema.org recipe most recipe sites embed, without the noise."""
+def _raw_structured_recipe(page: str) -> dict | None:
     for block in _JSON_LD.findall(page):
         try:
             recipe = _find_recipe(json.loads(html.unescape(block).strip()))
         except ValueError:
             continue
         if recipe:
-            keep = (
-                "name",
-                "description",
-                "recipeYield",
-                "prepTime",
-                "cookTime",
-                "totalTime",
-                "recipeIngredient",
-                "recipeInstructions",
-            )
-            return {k: recipe[k] for k in keep if k in recipe}
+            return recipe
+    return None
+
+
+def _image_link(value) -> str | None:
+    """schema.org allows a link, an ImageObject or a list of either."""
+    if isinstance(value, list):
+        return next((link for link in map(_image_link, value) if link), None)
+    if isinstance(value, dict):
+        return _image_link(value.get("url") or value.get("contentUrl"))
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def find_image(page: str, base_url: str) -> str | None:
+    """The title picture of the page: og:image first, then the recipe's own image."""
+    link = None
+    for tag in _META_TAG.findall(page):
+        attrs = {k.lower(): html.unescape(v[1:-1]) for k, v in _META_ATTR.findall(tag)}
+        if (attrs.get("property") or attrs.get("name", "")).lower() in ("og:image", "og:image:url"):
+            link = attrs.get("content", "").strip() or None
+            if link:
+                break
+    if not link:
+        link = _image_link((_raw_structured_recipe(page) or {}).get("image"))
+    if not link:
+        return None
+    link = urljoin(base_url, link)
+    if urlsplit(link).scheme not in ("http", "https") or len(link) > 1000:
+        return None
+    return link
+
+
+def image_for(source_url: str | None) -> str | None:
+    """The picture of a page read before, for the recipe that came from it."""
+    return _PAGE_IMAGES.get(source_url or "")
+
+
+def extract_structured_recipe(page: str) -> dict | None:
+    """Return the schema.org recipe most recipe sites embed, without the noise."""
+    recipe = _raw_structured_recipe(page)
+    if recipe:
+        keep = (
+            "name",
+            "description",
+            "recipeYield",
+            "prepTime",
+            "cookTime",
+            "totalTime",
+            "recipeIngredient",
+            "recipeInstructions",
+        )
+        return {k: recipe[k] for k in keep if k in recipe}
     return None
 
 
@@ -144,10 +192,17 @@ def page_text(page: str) -> str:
 def read_recipe_page(url: str) -> dict:
     final_url, page = _download(url.strip())
     structured = extract_structured_recipe(page)
+    image_url = find_image(page, final_url)
+    if image_url:
+        with _LOCK:
+            _PAGE_IMAGES[final_url] = image_url
+            while len(_PAGE_IMAGES) > _MAX_PAGE_IMAGES:
+                _PAGE_IMAGES.pop(next(iter(_PAGE_IMAGES)))
     return {
         "source_url": final_url,
         "structured_recipe": structured,
         "page_text": None if structured else page_text(page),
+        "image_url": image_url,
     }
 
 
@@ -251,8 +306,14 @@ def build_recipe(
     }
 
 
-def store_proposal(chat_id: int, recipe: dict) -> dict:
-    proposal = {"id": uuid.uuid4().hex[:12], "status": "open", "announced": False, "recipe": recipe}
+def store_proposal(chat_id: int, recipe: dict, image_url: str | None = None) -> dict:
+    proposal = {
+        "id": uuid.uuid4().hex[:12],
+        "status": "open",
+        "announced": False,
+        "recipe": recipe,
+        "image_url": image_url,
+    }
     with _LOCK:
         proposals = _load()
         proposals[str(chat_id)] = proposal
@@ -288,18 +349,32 @@ def discard_proposal(chat_id: int, proposal_id: str) -> bool:
 
 
 def save_proposal(chat_id: int, proposal_id: str) -> dict | None:
-    """Create the recipe in Mahlino. Returns None if it was already handled."""
+    """Create the recipe in Mahlino. Returns None if it was already handled.
+
+    The result carries "image_saved": True, False (the photo failed) or None
+    (there was none). A failed photo does not undo the recipe.
+    """
     proposal = _claim(chat_id, proposal_id)
     if not proposal:
         return None
     try:
-        return mahlino.create_recipe_sync(proposal["recipe"])
+        created = mahlino.create_recipe_sync(proposal["recipe"])
     except Exception:
         with _LOCK:
             proposals = _load()
             proposals.setdefault(str(chat_id), proposal)
             _write(proposals)
         raise
+    image_url = proposal.get("image_url")
+    created["image_saved"] = None
+    if image_url:
+        try:
+            mahlino.set_recipe_image_from_url_sync(created["slug"], image_url)
+            created["image_saved"] = True
+        except Exception as e:
+            log.warning("Recipe photo %s not saved: %s", image_url, e)
+            created["image_saved"] = False
+    return created
 
 
 def format_steps(instructions: str) -> list[str]:
@@ -316,7 +391,7 @@ def format_steps(instructions: str) -> list[str]:
     return lines
 
 
-def format_proposal(recipe: dict, limit: int = 3500) -> str:
+def format_proposal(recipe: dict, limit: int = 3500, has_image: bool = False) -> str:
     times = [
         f"{label} {value} min"
         for label, value in (("Zubereitung", recipe["prep_minutes"]), ("Garen", recipe["cook_minutes"]))
@@ -346,5 +421,7 @@ def format_proposal(recipe: dict, limit: int = 3500) -> str:
         lines.append("\nKeine eigene Anleitung: Das Panel zeigt dafür die Quellseite.")
     if recipe["source_url"]:
         lines.append(f"\nQuelle: {recipe['source_url']}")
+    if has_image:
+        lines.append("Das Foto von der Seite wird mit übernommen.")
     text = "\n".join(lines)
     return text if len(text) <= limit else f"{text[:limit]}… (Anzeige gekürzt, gespeichert wird alles)"

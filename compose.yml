@@ -20,3 +20,13 @@ services:
     volumes:
       # per-user kleinanzeigen config dirs (config.yaml + ads/)
       - /docker-volumes/kleinanzeiger/kleinanzeigen-config:/docker-volumes/kleinanzeiger/kleinanzeigen-config
+    # "web" is the network Mahlino is on as well. Mahlino reaches the recipe
+    # import endpoint (recipe_import_api.py) there as
+    # http://kleinanzeigen-agent:8090, so no port is published on the host.
+    networks:
+      - default
+      - web
+
+networks:
+  web:
+    external: true
