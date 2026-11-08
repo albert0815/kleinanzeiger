@@ -372,6 +372,20 @@ def _local_images(ad_file: Path, data: dict) -> list[Path]:
     return sorted(found)
 
 
+def _drop_individual_shipping_costs(data: dict) -> None:
+    """Remove shipping costs that no predefined carrier option matches.
+
+    Kleinanzeigen no longer offers individual shipping costs for new ads, and
+    the bot refuses to publish an ad that has shipping_costs but no
+    shipping_options. Older ads still show such costs online (e.g. "Versand ab
+    0,00 €"). Without the costs the bot only enables shipping, and Kleinanzeigen
+    picks its default package for the category, as for new drafts.
+    """
+    if data.get("shipping_options"):
+        return
+    data.pop("shipping_costs", None)
+
+
 def merge_online_data(ad_file: Path, downloaded: Path) -> list[str]:
     """Update a local ad with its online data. Returns the changed field names.
 
@@ -383,6 +397,7 @@ def merge_online_data(ad_file: Path, downloaded: Path) -> list[str]:
     if not remote.get("title") or not remote.get("description"):
         raise ValueError(f"Unvollständige Online-Daten: {downloaded}")
 
+    _drop_individual_shipping_costs(remote)
     changed = [f for f in _FIELDS_FROM_ONLINE if local.get(f) != remote.get(f)]
     for field_name in changed:
         local[field_name] = remote.get(field_name)
