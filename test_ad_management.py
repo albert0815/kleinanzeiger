@@ -229,6 +229,32 @@ class MergeOnlineDataTest(TempBase):
         self.assertEqual(data["images"], ["x1.jpg", "x2.jpg"])
         self.assertFalse((self.local.parent / "a.jpg").exists())
 
+    def write_remote_shipping(self, **shipping):
+        self.remote.write_text(
+            yaml.safe_dump(
+                {"title": "Jacke", "description": "neu", "price": 30,
+                 "shipping_type": "SHIPPING", **shipping}
+            )
+        )
+
+    def test_individual_shipping_costs_are_dropped(self):
+        data = yaml.safe_load(self.local.read_text())
+        data.update(shipping_type="SHIPPING", shipping_costs=0.0, shipping_options=None)
+        self.local.write_text(yaml.safe_dump(data, allow_unicode=True))
+        self.write_remote_shipping(shipping_costs=0.0, shipping_options=None)
+        ad_store.merge_online_data(self.local, self.remote)
+        data = yaml.safe_load(self.local.read_text())
+        self.assertEqual(data["shipping_type"], "SHIPPING")
+        self.assertIsNone(data["shipping_costs"])
+        self.assertIsNone(data["shipping_options"])
+
+    def test_predefined_online_shipping_is_kept(self):
+        self.write_remote_shipping(shipping_costs=3.99, shipping_options=["DHL_2"])
+        ad_store.merge_online_data(self.local, self.remote)
+        data = yaml.safe_load(self.local.read_text())
+        self.assertEqual(data["shipping_options"], ["DHL_2"])
+        self.assertEqual(data["shipping_costs"], 3.99)
+
     def test_incomplete_download_changes_nothing(self):
         before = self.local.read_text()
         self.remote.write_text(yaml.safe_dump({"title": "Jacke"}))
