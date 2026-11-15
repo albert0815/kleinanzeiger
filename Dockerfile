@@ -10,7 +10,7 @@
 FROM python:3.12-slim AS kleinanzeigen-bot-build
 
 # Pinned on purpose; update it deliberately after testing a newer upstream commit.
-ARG KLEINANZEIGEN_BOT_REF=2687db605f1b6d1aae5b11320deb6a3667bd9aaa
+ARG KLEINANZEIGEN_BOT_REF=9226691bb04a82ce95813f61bce8487f7209b7ea
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git binutils build-essential ca-certificates \
