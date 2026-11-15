@@ -10,7 +10,7 @@
 FROM python:3.12-slim AS kleinanzeigen-bot-build
 
 # Pinned on purpose; update it deliberately after testing a newer upstream commit.
-ARG KLEINANZEIGEN_BOT_REF=32cbee7d5d8ef998aa363c719f091894373d714d
+ARG KLEINANZEIGEN_BOT_REF=9226691bb04a82ce95813f61bce8487f7209b7ea
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git binutils build-essential ca-certificates \
@@ -23,9 +23,6 @@ RUN pip install --no-cache-dir pdm \
     && git -C /opt/kleinanzeigen-bot-src checkout --detach FETCH_HEAD
 
 COPY scripts/patch_nodriver_connect_timeout.py /opt/patch_nodriver_connect_timeout.py
-# Reads the labels of the redesigned category dialog; see the script for why.
-COPY scripts/patch_category_dialog_labels.py /opt/patch_category_dialog_labels.py
-COPY scripts/test_category_dialog_patch.py /opt/test_category_dialog_patch.py
 # Adds a `fields` command and names fields in form errors; see the script.
 COPY scripts/patch_category_fields_command.py /opt/patch_category_fields_command.py
 COPY bot-patches/ /opt/bot-patches/
@@ -36,10 +33,9 @@ WORKDIR /opt/kleinanzeigen-bot-src
 # (scripts/fix_nodriver.py) first; our extra patch is applied on top of that.
 RUN pdm install -v \
     && pdm run python /opt/patch_nodriver_connect_timeout.py \
-    && python /opt/patch_category_dialog_labels.py \
     && python /opt/patch_category_fields_command.py /opt/bot-patches \
-    && cp /opt/test_category_dialog_patch.py /opt/test_fields_command.py tests/unit/ \
-    && pdm run pytest -q -p no:cacheprovider --no-cov tests/unit/test_category_dialog_patch.py tests/unit/test_fields_command.py \
+    && cp /opt/test_fields_command.py tests/unit/ \
+    && pdm run pytest -q -p no:cacheprovider --no-cov tests/unit/test_fields_command.py \
     && pdm run compile \
     && ./dist/kleinanzeigen-bot --help
 
